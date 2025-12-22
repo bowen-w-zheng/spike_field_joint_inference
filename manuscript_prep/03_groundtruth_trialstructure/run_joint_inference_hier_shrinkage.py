@@ -4,10 +4,10 @@ Run HIERARCHICAL joint inference algorithm on trial data.
 WITH BETA SHRINKAGE to fix low-frequency artifacts.
 
 Usage:
-    python run_joint_inference_hier_shrinkage.py --input ./data/sim.pkl --output ./results/joint.pkl
+    python run_joint_inference_hier_shrinkage.py --input ./data/sim_with_trials.pkl --output ./results/joint_inference.pkl
     
 To disable shrinkage:
-    python run_joint_inference_hier_shrinkage.py --input ./data/sim.pkl --output ./results/joint.pkl --no_shrinkage
+    python run_joint_inference_hier_shrinkage.py --input ./data/sim_with_trials.pkl --output ./results/joint.pkl --no_shrinkage
 """
 import sys
 import os
@@ -369,9 +369,9 @@ def main():
                         help='Output path for results')
     parser.add_argument('--max_iter', type=int, default=10000,
                         help='Max EM iterations')
-    parser.add_argument('--fixed_iter', type=int, default=1000,
+    parser.add_argument('--fixed_iter', type=int, default=300,
                         help='Fixed MCMC iterations')
-    parser.add_argument('--n_refreshes', type=int, default=4,
+    parser.add_argument('--n_refreshes', type=int, default=5,
                         help='Number of MCMC refreshes')
     parser.add_argument('--trace_thin', type=int, default=1,
                         help='Thinning factor for trace')
