@@ -44,16 +44,6 @@ def tanh_x(x):
 
     Uses rational polynomial approximation from Cody and Waite (1980)
     for x <= 4.95, and 1/x approximation for larger x.
-
-    Parameters
-    ----------
-    x : float or array
-        Input value(s)
-
-    Returns
-    -------
-    float or array
-        tanh(x) / x
     """
     # Coefficients for rational polynomial
     p0 = -0.16134119023996228053e+04
@@ -77,39 +67,13 @@ def tanh_x(x):
 
 @jax.jit
 def tan_x(x):
-    """
-    Compute f(x) = tan(x) / x.
-
-    Parameters
-    ----------
-    x : float or array
-        Input value(s)
-
-    Returns
-    -------
-    float or array
-        tan(x) / x
-    """
+    """Compute f(x) = tan(x) / x."""
     return jnp.tan(x) / x
 
 
 @jax.jit
 def cumulant(u, log_cosh_z):
-    """
-    Compute K(t), the cumulant generating function of X.
-
-    Parameters
-    ----------
-    u : float
-        Input value
-    log_cosh_z : float
-        Pre-computed log(cosh(z))
-
-    Returns
-    -------
-    float
-        K(u)
-    """
+    """Compute K(t), the cumulant generating function of X."""
     def neg_case():
         return log_cosh_z - jnp.log(jnp.cosh(jnp.sqrt(-2.0 * u)))
 
@@ -128,19 +92,7 @@ def cumulant(u, log_cosh_z):
 
 @jax.jit
 def cumulant_prime(u):
-    """
-    Compute K'(t) and K''(t), the first and second derivatives of the CGF.
-
-    Parameters
-    ----------
-    u : float
-        Input value
-
-    Returns
-    -------
-    tuple of (float, float)
-        (K'(u), K''(u))
-    """
+    """Compute K'(t) and K''(t), the first and second derivatives of the CGF."""
     s = 2.0 * u
 
     def compute_derivatives():
@@ -156,19 +108,7 @@ def cumulant_prime(u):
 
 
 def select_starting_guess(x):
-    """
-    Select the starting guess for Newton's method given a value of x.
-
-    Parameters
-    ----------
-    x : float
-        Input value
-
-    Returns
-    -------
-    float
-        Starting guess for u
-    """
+    """Select the starting guess for Newton's method given a value of x."""
     return jnp.select(
         [x <= 0.25, x <= 0.5, x <= 1.0, x <= 1.5, x <= 2.5, x <= 4.0],
         [-9.0, -1.78, -0.147, 0.345, 0.72, 0.95],
@@ -178,27 +118,7 @@ def select_starting_guess(x):
 
 @jax.jit
 def newton_raphson(arg, x0, max_iter=25, atol=1e-5, rtol=1e-5):
-    """
-    Solve for the root of (f(u) = K'(t) - arg) using Newton's method.
-
-    Parameters
-    ----------
-    arg : float
-        Target value
-    x0 : float
-        Initial guess
-    max_iter : int
-        Maximum iterations
-    atol : float
-        Absolute tolerance
-    rtol : float
-        Relative tolerance
-
-    Returns
-    -------
-    tuple of (float, float)
-        (root, K''(root))
-    """
+    """Solve for the root of (f(u) = K'(t) - arg) using Newton's method."""
     def cond_fn(state):
         i, x, x_old, converged = state
         return (i < max_iter) & (~converged)
@@ -229,37 +149,13 @@ def newton_raphson(arg, x0, max_iter=25, atol=1e-5, rtol=1e-5):
 
 @jax.jit
 def pgm_lgamma(z):
-    """
-    Compute logarithm of the gamma function.
-
-    Parameters
-    ----------
-    z : float
-        Input value
-
-    Returns
-    -------
-    float
-        log(Gamma(z))
-    """
+    """Compute logarithm of the gamma function."""
     return jsp.special.gammaln(z)
 
 
 @jax.jit
 def log_norm_cdf(x):
-    """
-    Compute the logarithm of the standard normal CDF.
-
-    Parameters
-    ----------
-    x : float
-        Input value
-
-    Returns
-    -------
-    float
-        log(Phi(x))
-    """
+    """Compute the logarithm of the standard normal CDF."""
     return jnp.log1p(-0.5 * jsp.special.erfc(x / jnp.sqrt(2.0)))
 
 
@@ -269,26 +165,7 @@ def log_norm_cdf(x):
 
 @jax.jit
 def confluent_x_smaller(p, x, max_iter=100):
-    """
-    Compute G(p, x) using continued fraction for x <= p.
-
-    Uses Modified Lentz method.
-
-    Parameters
-    ----------
-    p : float
-        Parameter
-    x : float
-        Argument
-    max_iter : int
-        Maximum iterations
-
-    Returns
-    -------
-    float
-        G(p, x)
-    """
-    # Use float64 consistently
+    """Compute G(p, x) using continued fraction for x <= p."""
     eps = jnp.finfo(jnp.float64).eps
     tiny = jnp.finfo(jnp.float64).tiny
 
@@ -331,26 +208,7 @@ def confluent_x_smaller(p, x, max_iter=100):
 
 @jax.jit
 def confluent_p_smaller(p, x, max_iter=100):
-    """
-    Compute G(p, x) using continued fraction for x > p.
-
-    Uses Modified Lentz method.
-
-    Parameters
-    ----------
-    p : float
-        Parameter
-    x : float
-        Argument
-    max_iter : int
-        Maximum iterations
-
-    Returns
-    -------
-    float
-        G(p, x)
-    """
-    # Use float64 consistently
+    """Compute G(p, x) using continued fraction for x > p."""
     eps = jnp.finfo(jnp.float64).eps
     tiny = jnp.finfo(jnp.float64).tiny
 
@@ -391,26 +249,7 @@ def confluent_p_smaller(p, x, max_iter=100):
 
 @jax.jit
 def upper_incomplete_gamma(p, x, normalized=False):
-    """
-    Compute the upper incomplete gamma function using continued fractions.
-
-    Simplified version that always uses continued fractions to avoid
-    concretization issues with traced values.
-
-    Parameters
-    ----------
-    p : float
-        Shape parameter
-    x : float
-        Upper limit
-    normalized : bool
-        If True, return normalized version
-
-    Returns
-    -------
-    float
-        Upper incomplete gamma Q(p, x)
-    """
+    """Compute the upper incomplete gamma function using continued fractions."""
     max_exp = 88.7228
 
     # Use continued fractions for all cases
@@ -450,27 +289,7 @@ def upper_incomplete_gamma(p, x, normalized=False):
 
 @jax.jit
 def piecewise_coef(n, x, logx, z, k):
-    """
-    Compute a_n(x|t), the nth term of the alternating sum S_n(x|t).
-
-    Parameters
-    ----------
-    n : int
-        Term index
-    x : float
-        Sample value
-    logx : float
-        log(x)
-    z : float
-        Half of |z| parameter
-    k : float
-        PI2_8 + 0.5 * z^2
-
-    Returns
-    -------
-    float
-        a_n coefficient
-    """
+    """Compute a_n(x|t), the nth term of the alternating sum S_n(x|t)."""
     def large_x_case():
         b = PI * (n + 0.5)
         return b * jnp.exp(-0.5 * x * b * b)
@@ -484,27 +303,7 @@ def piecewise_coef(n, x, logx, z, k):
 
 @jax.jit
 def random_right_bounded_invgauss(key, z, z2, k, max_iter=10000):
-    """
-    Sample from an Inverse-Gaussian(1/z, 1) truncated on {x | x < T}.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        Random key
-    z : float
-        Half of |z| parameter
-    z2 : float
-        z^2
-    k : float
-        PI2_8 + 0.5 * z^2
-    max_iter : int
-        Maximum iterations for safety
-
-    Returns
-    -------
-    tuple of (PRNGKey, float)
-        (new_key, sample)
-    """
+    """Sample from an Inverse-Gaussian(1/z, 1) truncated on {x | x < T}."""
     def small_z_case(key):
         """Case when z < 1.5625 (i.e., 1/z < T)"""
         def cond_fn(state):
@@ -526,7 +325,6 @@ def random_right_bounded_invgauss(key, z, z2, k, max_iter=10000):
             x_prop = T / ((1.0 + T * e1) ** 2)
 
             # Check second condition (if z > 0)
-            # Accept if log(U) <= -0.5 * z^2 * X (equivalent to U <= exp(-0.5 * z^2 * X))
             u = random.uniform(subkey3)
             accept2 = (z <= 0.0) | (u <= jnp.exp(-0.5 * z2 * x_prop))
 
@@ -574,29 +372,7 @@ def random_right_bounded_invgauss(key, z, z2, k, max_iter=10000):
 
 @jax.jit
 def random_jacobi_star(key, z, z2, k, proposal_probability, max_iter=10000):
-    """
-    Generate a random sample J*(1, z) using the Devroye method.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        Random key
-    z : float
-        Half of |z| parameter
-    z2 : float
-        z^2
-    k : float
-        PI2_8 + 0.5 * z^2
-    proposal_probability : float
-        Probability of using inverse-Gaussian proposal
-    max_iter : int
-        Maximum iterations for safety
-
-    Returns
-    -------
-    tuple of (PRNGKey, float)
-        (new_key, sample)
-    """
+    """Generate a random sample J*(1, z) using the Devroye method."""
     def cond_fn(state):
         key, x, accepted, iter_count = state
         return (~accepted) & (iter_count < max_iter)
@@ -719,25 +495,7 @@ def sample_pg_devroye_single(key, h, z):
 
 @jax.jit
 def invgauss_logcdf(x, mu, lam):
-    """
-    Calculate the log CDF of an Inverse-Gaussian distribution.
-
-    Uses the computation method from Giner and Smyth (2016).
-
-    Parameters
-    ----------
-    x : float
-        Point at which to evaluate
-    mu : float
-        Mean parameter
-    lam : float
-        Shape parameter
-
-    Returns
-    -------
-    float
-        log(CDF(x))
-    """
+    """Calculate the log CDF of an Inverse-Gaussian distribution."""
     qm = x / mu
     tm = mu / lam
     r = jnp.sqrt(x / lam)
@@ -749,25 +507,7 @@ def invgauss_logcdf(x, mu, lam):
 
 @jax.jit
 def random_left_bounded_gamma(key, a, b, t):
-    """
-    Sample from Gamma(a, rate=b) truncated on {x | x > t}.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        Random key
-    a : float
-        Shape parameter
-    b : float
-        Rate parameter
-    t : float
-        Lower truncation point
-
-    Returns
-    -------
-    tuple of (PRNGKey, float)
-        (new_key, sample)
-    """
+    """Sample from Gamma(a, rate=b) truncated on {x | x > t}."""
     def a_greater_1(key):
         """Dagpunar (1978) algorithm for a > 1"""
         bt = t * b
@@ -845,27 +585,7 @@ def random_left_bounded_gamma(key, a, b, t):
 
 @jax.jit
 def saddle_point(x, h, z_half, log_cosh_z, sqrt_h2pi):
-    """
-    Compute the saddle point estimate at x.
-
-    Parameters
-    ----------
-    x : float
-        Point at which to evaluate
-    h : float
-        Shape parameter
-    z_half : float
-        Half of |z|
-    log_cosh_z : float
-        log(cosh(z_half))
-    sqrt_h2pi : float
-        sqrt(h / (2*pi))
-
-    Returns
-    -------
-    float
-        Saddle point approximation value
-    """
+    """Compute the saddle point estimate at x."""
     x0 = select_starting_guess(x)
     u, fprime = newton_raphson(x, x0)
     t = u + 0.5 * z_half * z_half
@@ -877,37 +597,7 @@ def saddle_point(x, h, z_half, log_cosh_z, sqrt_h2pi):
 def bounding_kernel(x, xc, logxc, h, left_tangent_slope, left_tangent_intercept,
                    right_tangent_slope, right_tangent_intercept,
                    left_kernel_coef, right_kernel_coef):
-    """
-    Compute k(x|h,z), the bounding kernel of the saddle point approximation.
-
-    Parameters
-    ----------
-    x : float
-        Point at which to evaluate
-    xc : float
-        Center point
-    logxc : float
-        log(xc)
-    h : float
-        Shape parameter
-    left_tangent_slope : float
-        Slope of left tangent line
-    left_tangent_intercept : float
-        Intercept of left tangent line
-    right_tangent_slope : float
-        Slope of right tangent line
-    right_tangent_intercept : float
-        Intercept of right tangent line
-    left_kernel_coef : float
-        Left kernel coefficient
-    right_kernel_coef : float
-        Right kernel coefficient
-
-    Returns
-    -------
-    float
-        Bounding kernel value
-    """
+    """Compute k(x|h,z), the bounding kernel of the saddle point approximation."""
     def right_case():
         point = right_tangent_slope * x + right_tangent_intercept
         return jnp.exp(h * (logxc + point) + (h - 1.0) * jnp.log(x)) * right_kernel_coef
@@ -1070,20 +760,6 @@ def sample_pg_normal_single(key, h, z):
 
     Uses truncated normal to ensure samples are always positive, as required
     for Polya-Gamma distributions.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        Random key
-    h : float
-        Shape parameter (large)
-    z : float
-        Exponential tilting parameter
-
-    Returns
-    -------
-    float
-        Sample from PG(h, z)
     """
     def z_zero_case():
         mean = 0.25 * h
@@ -1101,8 +777,6 @@ def sample_pg_normal_single(key, h, z):
     mean, stdev = jax.lax.cond(z == 0.0, z_zero_case, z_nonzero_case)
 
     # Sample from truncated normal to ensure positivity
-    # For large h, the distribution is concentrated around the mean,
-    # so we use rejection sampling with a safety limit
     max_iter = 100
 
     def cond_fn(state):
@@ -1124,258 +798,3 @@ def sample_pg_normal_single(key, h, z):
     # If we still don't have a positive sample (very unlikely for large h),
     # fall back to using the mean
     return jnp.where(sample_final > 0.0, sample_final, mean)
-
-
-# ==============================================================================
-# Hybrid Sampler Selection
-# ==============================================================================
-
-@partial(jax.jit, static_argnames=['h'])
-def sample_pg_single(key, h, z):
-    """
-    Sample from PG(h, z) using the best method based on parameters.
-
-    Hybrid selection logic:
-    - h > 50: Normal approximation
-    - h >= 8 or (h > 4 and z <= 4): Saddle method
-    - h == 1 or (h is integer and z <= 1): Devroye method
-    - Otherwise: Saddle method (as fallback)
-
-    Parameters
-    ----------
-    key : PRNGKey
-        Random key
-    h : float
-        Shape parameter (must be positive)
-    z : float
-        Exponential tilting parameter
-
-    Returns
-    -------
-    float
-        Sample from PG(h, z)
-    """
-    z_abs = jnp.abs(z)
-
-    # Decision logic
-    use_normal = h > 50.0
-    use_devroye = (h == 1.0) | ((h == jnp.floor(h)) & (z_abs <= 1.0))
-    use_saddle = (~use_normal) & (~use_devroye)
-
-    def normal_fn():
-        return sample_pg_normal_single(key, h, z)
-
-    def devroye_fn():
-        return sample_pg_devroye_single(key, h, z)
-
-    def saddle_fn():
-        return sample_pg_saddle_single(key, h, z)
-
-    return jax.lax.cond(
-        use_normal,
-        normal_fn,
-        lambda: jax.lax.cond(use_devroye, devroye_fn, saddle_fn)
-    )
-
-
-# ==============================================================================
-# Public API
-# ==============================================================================
-
-def create_pg_sampler(h=1.0, batch_size=None, method='hybrid', warmup=True):
-    """
-    Create a pre-compiled and optionally pre-warmed Polya-Gamma sampler.
-
-    This function creates a batch sampler that avoids recompilation when z values
-    change. The sampler is JIT-compiled and optionally warmed up with the specified
-    batch size, ensuring optimal performance for iterative algorithms like MCMC.
-
-    Parameters
-    ----------
-    h : float, optional
-        Shape parameter (default: 1.0). Fixed at compilation time.
-    batch_size : int, optional
-        Number of samples per batch. If provided and warmup=True, the sampler
-        will be pre-warmed for this exact size (default: None).
-    method : str, optional
-        Sampling method (default: 'hybrid'):
-        - 'saddle': Recommended for most uses. Excellent speed/accuracy balance.
-        - 'hybrid': Automatically selects between devroye and saddle based on (h, z).
-        - 'devroye': Direct implementation of Devroye (2009) algorithm.
-        - 'normal': Normal approximation, faster but less accurate for small z.
-    warmup : bool, optional
-        Whether to perform warmup compilation (default: True). Warmup ensures
-        the first call is fast. Only applies if batch_size is provided.
-
-    Returns
-    -------
-    callable
-        A JIT-compiled sampler function with signature (key, z_array) -> samples.
-        The z_array must have the same shape and dtype as the warmup size for
-        optimal performance (no recompilation).
-
-    Examples
-    --------
-    >>> # Create a pre-warmed sampler for MCMC with 1000 samples
-    >>> sampler = create_pg_sampler(h=1.0, batch_size=1000)
-    >>>
-    >>> # Use it in an MCMC loop - no recompilation when z changes!
-    >>> for iteration in range(100):
-    ...     z = compute_new_z()  # Your MCMC update
-    ...     z_array = jnp.full(1000, z)
-    ...     samples = sampler(key, z_array)  # Fast!
-    >>>
-    >>> # Can also create without warmup and specify size later
-    >>> sampler = create_pg_sampler(h=1.0, warmup=False)
-    >>> samples = sampler(key, jnp.full(500, 2.0))  # First call compiles
-
-    Notes
-    -----
-    - Changing h requires creating a new sampler
-    - Changing batch_size triggers recompilation (create new sampler instead)
-    - Changing only z values (same size/dtype) reuses the compiled code
-    """
-    # Select the sampling method
-    if method == 'hybrid':
-        single_sampler = sample_pg_single
-    elif method == 'devroye':
-        single_sampler = sample_pg_devroye_single
-    elif method == 'saddle':
-        single_sampler = sample_pg_saddle_single
-    elif method == 'normal':
-        single_sampler = sample_pg_normal_single
-    else:
-        raise ValueError(f"Unknown method: {method}. Use 'hybrid', 'devroye', 'saddle', or 'normal'.")
-
-    # Create JIT-compiled batch sampler
-    @jax.jit
-    def batch_sampler(key, z_array):
-        """Sample from PG(h, z) for a batch of z values."""
-        z_array = jnp.asarray(z_array, dtype=jnp.float64)
-        n = z_array.shape[0]
-        keys = random.split(key, n)
-        sample_fn = lambda k, z: single_sampler(k, h, z)
-        samples = jax.vmap(sample_fn)(keys, z_array)
-        return samples
-
-    # Perform warmup if requested and batch_size is provided
-    if warmup and batch_size is not None:
-        warmup_key = random.PRNGKey(0)
-        warmup_z = jnp.full(batch_size, 1.0, dtype=jnp.float64)
-        # Run warmup multiple times to ensure compilation is complete
-        for _ in range(3):
-            batch_sampler(warmup_key, warmup_z).block_until_ready()
-
-    return batch_sampler
-
-
-@partial(jax.jit, static_argnames=['h'])
-def sample_pg_batch(key, z_array, h=1.0):
-    """
-    Sample from PG(h, z) for a batch of z values using GPU acceleration.
-
-    This function is JIT-compiled and will parallelize across the batch dimension.
-    For iterative use with changing z values, consider using create_pg_sampler()
-    instead, which provides better control over warmup and avoids recompilation.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        JAX random key
-    z_array : array_like
-        Array of z values (exponential tilting parameters)
-    h : float, optional
-        Shape parameter (default: 1.0). Currently only supports scalar h.
-
-    Returns
-    -------
-    jnp.ndarray
-        Array of samples from PG(h, z) for each z in z_array
-
-    Examples
-    --------
-    >>> import jax
-    >>> from polyagamma_jax import sample_pg_batch
-    >>>
-    >>> key = jax.random.PRNGKey(42)
-    >>> z_array = jnp.array([0.5, 1.0, 2.0, 5.0])
-    >>> samples = sample_pg_batch(key, z_array)
-    >>>
-    >>> # For iterative MCMC-style usage, use create_pg_sampler instead:
-    >>> from polyagamma_jax import create_pg_sampler
-    >>> sampler = create_pg_sampler(h=1.0, batch_size=1000)
-    >>> for z_val in [0.5, 1.0, 2.0]:
-    ...     samples = sampler(key, jnp.full(1000, z_val))  # No recompilation!
-
-    See Also
-    --------
-    create_pg_sampler : Create a pre-warmed sampler for iterative use
-    """
-    z_array = jnp.asarray(z_array, dtype=jnp.float64)
-    n = z_array.shape[0]
-
-    # Split keys for each sample
-    keys = random.split(key, n)
-
-    # Vectorize over the batch
-    sample_fn = lambda k, z: sample_pg_single(k, h, z)
-    samples = jax.vmap(sample_fn)(keys, z_array)
-
-    return samples
-
-
-def sample_pg_improved(key, h=1.0, z=0.0, shape=()):
-    """
-    Flexible API for sampling from PG(h, z) with various shapes.
-
-    Parameters
-    ----------
-    key : PRNGKey
-        JAX random key
-    h : float or array_like, optional
-        Shape parameter(s) (default: 1.0)
-    z : float or array_like, optional
-        Exponential tilting parameter(s) (default: 0.0)
-    shape : tuple, optional
-        Shape of output array (default: ())
-
-    Returns
-    -------
-    jnp.ndarray or float
-        Sample(s) from PG(h, z)
-
-    Examples
-    --------
-    >>> # Single sample
-    >>> sample = sample_pg_improved(key, h=1.0, z=2.0)
-    >>>
-    >>> # Multiple samples with same h, z
-    >>> samples = sample_pg_improved(key, h=1.0, z=2.0, shape=(1000,))
-    >>>
-    >>> # Multiple samples with varying z
-    >>> z_array = jnp.array([0.5, 1.0, 2.0])
-    >>> samples = sample_pg_improved(key, h=1.0, z=z_array)
-    """
-    h = jnp.asarray(h)
-    z = jnp.asarray(z)
-
-    # Determine output shape
-    if shape:
-        n = int(jnp.prod(jnp.array(shape)))
-        keys = random.split(key, n)
-
-        # Broadcast h and z if needed
-        h_broadcast = jnp.broadcast_to(h, (n,))
-        z_broadcast = jnp.broadcast_to(z, (n,))
-
-        # Sample for each combination
-        def sample_single_wrapper(k, h_val, z_val):
-            # Convert to Python int if h is integer-like
-            h_use = float(h_val)
-            return sample_pg_single(k, h_use, z_val)
-
-        samples = jax.vmap(sample_single_wrapper)(keys, h_broadcast, z_broadcast)
-        return samples.reshape(shape)
-    else:
-        # Single sample
-        return sample_pg_single(key, float(h), float(z))

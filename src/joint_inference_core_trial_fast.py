@@ -11,6 +11,7 @@ import jax.numpy as jnp
 
 from src.params import OUParams
 from src.joint_inference_core import joint_kf_rts_moments  # single-trial smoother
+from src.utils_common import separated_to_interleaved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,34 +112,6 @@ def _gamma_default(S: int, L: int) -> np.ndarray:
     return np.zeros((S, L), float)
 
 
-def _separated_to_interleaved(beta_sep: np.ndarray) -> np.ndarray:
-    """
-    Convert beta from SEPARATED layout to INTERLEAVED layout.
-    
-    SEPARATED (used by simulation & Gibbs sampler):
-        [β₀, βR_0, βR_1, ..., βR_{J-1}, βI_0, βI_1, ..., βI_{J-1}]
-    
-    INTERLEAVED (expected by joint_kf_rts_moments):
-        [β₀, βR_0, βI_0, βR_1, βI_1, ..., βR_{J-1}, βI_{J-1}]
-    
-    Parameters
-    ----------
-    beta_sep : (S, 1+2J) array in separated layout
-    
-    Returns
-    -------
-    beta_int : (S, 1+2J) array in interleaved layout
-    """
-    S, P = beta_sep.shape
-    J = (P - 1) // 2
-    beta_int = np.zeros_like(beta_sep)
-    beta_int[:, 0] = beta_sep[:, 0]  # β₀
-    for j in range(J):
-        beta_int[:, 1 + 2*j] = beta_sep[:, 1 + j]          # βR_j
-        beta_int[:, 1 + 2*j + 1] = beta_sep[:, 1 + J + j]  # βI_j
-    return beta_int
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main trial-aware refresh (always supports per-trial Z; optional X/D)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,7 +206,7 @@ def joint_kf_rts_moments_trials_fast(
 
     # Reduce β if given per trial, then convert to interleaved layout
     beta_use = np.median(beta, axis=1) if beta.ndim == 3 else np.asarray(beta, float)  # (S,P)
-    beta_use = _separated_to_interleaved(beta_use)  # Convert to interleaved for joint_kf_rts_moments
+    beta_use = separated_to_interleaved(beta_use)  # Convert to interleaved for joint_kf_rts_moments
 
     # Single-trial smoother caller
     def _run_single_trial(
