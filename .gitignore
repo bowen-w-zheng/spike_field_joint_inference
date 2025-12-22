@@ -1,0 +1,42 @@
+# Data / artifacts
+**/data/
+**/Data/
+**/DATA/
+
+# NumPy
+*.npy
+*.npz
+
+# Pickle / Joblib
+*.pkl
+*.pickle
+*.joblib
+
+# HDF5 / MATLAB
+*.h5
+*.hdf5
+*.mat
+
+# Model checkpoints / tensors
+*.pt
+*.pth
+*.ckpt
+
+# Common outputs
+*.log
+
+# Python cache / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Slurm
+slurm/
+*.out
+*.err
+
+# Figures
+*.pdf
