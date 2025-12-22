@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 import numpy as np
 
-EPS = 1e-12
+from src.utils_common import (
+    centres_from_win,
+    map_blocks_to_fine,
+    build_t2k,
+    normalize_Y_to_RJMK,
+    EPS,
+)
+
 
 @dataclass
 class UpsampleResult:
@@ -17,6 +24,7 @@ class UpsampleResult:
     t_idx_of_k: np.ndarray # (K,)
     centres_sec: np.ndarray# (K,)
 
+
 # ---------------- helpers (shape-strict) ----------------
 def _expand_sig_eps_to_JMR(sig_eps_jmr: np.ndarray, J: int, M: int, R: int) -> np.ndarray:
     arr = np.asarray(sig_eps_jmr)
@@ -25,38 +33,6 @@ def _expand_sig_eps_to_JMR(sig_eps_jmr: np.ndarray, J: int, M: int, R: int) -> n
     if arr.shape == (1, 1, R):  return np.tile(arr, (J, M, 1))
     raise AssertionError(f"sig_eps_jmr must be (J,M,R) or (1,M,R) or (1,1,R); got {arr.shape}")
 
-def _centres_from_win(K: int, win_sec: float, offset_sec: float) -> np.ndarray:
-    return offset_sec + np.arange(K, dtype=float) * float(win_sec)
-
-def _map_blocks_to_fine(centres_sec: np.ndarray, delta_spk: float, T_f: int) -> np.ndarray:
-    idx = np.round(centres_sec / float(delta_spk)).astype(np.int64)
-    return np.clip(idx, 0, T_f - 1)
-
-def _normalize_to_RJMK(Y: np.ndarray, J: int, M: int) -> np.ndarray:
-    Y = np.asarray(Y)
-    assert Y.ndim == 4, "Y_trials must be 4D: (R,J,M,K) or (R,M,J,K)"
-    R, A, B, K = Y.shape
-    if (A, B) == (J, M):   # (R,J,M,K)
-        return Y
-    if (A, B) == (M, J):   # (R,M,J,K) -> (R,J,M,K)
-        return np.swapaxes(Y, 1, 2)
-    raise AssertionError(f"Y_trials second/third dims must be (J,M)={J,M} or (M,J)={M,J}; got {(A,B)}")
-
-def _build_t2k(centres_sec: np.ndarray, delta_spk: float, T_f: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Build (T_f, max_k_per_t) index table and per-t counts for block updates."""
-    t_idx = _map_blocks_to_fine(centres_sec, delta_spk, T_f)  # (K,)
-    T_f   = int(T_f)
-    buckets = [[] for _ in range(T_f)]
-    for k, t in enumerate(t_idx):
-        buckets[int(t)].append(k)
-    kcount = np.array([len(b) for b in buckets], dtype=np.int32)
-    max_k  = int(kcount.max(initial=0))
-    t2k = np.full((T_f, max_k), -1, dtype=np.int32)
-    for t in range(T_f):
-        row = buckets[t]
-        if row:
-            t2k[t, :len(row)] = np.asarray(row, dtype=np.int32)
-    return t2k, kcount
 
 # ---------------- scalar complex OU on fine grid (Numba + fallback) ----------------
 _HAS_NUMBA = False
@@ -144,6 +120,7 @@ else:
             P_s[t] = max(P_f[t] + Jt*Jt * (P_s[t+1] - P_p[t+1]), 1e-16)
         return m_s, P_s
 
+
 # ---------------- main upsampler ----------------
 def upsample_ct_hier_fine(
     *,
@@ -160,7 +137,7 @@ def upsample_ct_hier_fine(
     J, M  = lam_X.shape
 
     # (2) Normalize Y to (R,J,M,K)
-    Y_RJMK = _normalize_to_RJMK(Y_trials, J, M).astype(np.complex128)
+    Y_RJMK = normalize_Y_to_RJMK(Y_trials, J, M).astype(np.complex128)
     R, _, _, K = Y_RJMK.shape
 
     # (3) Strict shape checks
@@ -179,16 +156,16 @@ def upsample_ct_hier_fine(
     sig_eps_jmr = _expand_sig_eps_to_JMR(np.asarray(res.sig_eps_jmr, float), J, M, R)  # (J,M,R)
 
     # (4) Fine grid length — use right edge of last block so 10s/1ms -> 10000
-    centres_sec = _centres_from_win(K, win_sec, offset_sec)
+    centres_sec = centres_from_win(K, win_sec, offset_sec)
     t_end = centres_sec[-1] + 0.5 * float(win_sec)
     if T_f is None:
         T_f = int(round(t_end / float(delta_spk)))   # NO +1; 10.0/0.001 -> 10000
     assert T_f > 0, "T_f must be positive"
     # NEW: explicit block→fine index (length K)
-    t_idx_of_k = _map_blocks_to_fine(centres_sec, delta_spk, T_f)
+    t_idx_of_k = map_blocks_to_fine(centres_sec, delta_spk, T_f)
 
     # (5) Build block->fine index table (once)
-    t2k, kcount = _build_t2k(centres_sec, delta_spk, T_f)
+    t2k, kcount = build_t2k(centres_sec, delta_spk, T_f)
     # (6) OU params at fine step Δ
     phi_X = np.exp(-lam_X * float(delta_spk))
     q_X   = (sigv_X**2) * (1.0 - np.exp(-2.0 * lam_X * float(delta_spk))) / np.maximum(2.0 * lam_X, EPS)
@@ -243,6 +220,6 @@ def upsample_ct_hier_fine(
         X_mean=X_mean, X_var=X_var,
         D_mean=D_mean, D_var=D_var,
         Z_mean=Z_mean, Z_var=Z_var,
-        t_idx_of_k=_map_blocks_to_fine(centres_sec, delta_spk, T_f),
+        t_idx_of_k=map_blocks_to_fine(centres_sec, delta_spk, T_f),
         centres_sec=centres_sec,
     )

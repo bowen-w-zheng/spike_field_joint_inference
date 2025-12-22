@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import numpy as np
 from typing import NamedTuple
 
+from src.utils_common import centres_from_win, build_t2k
+
 class JointMoments(NamedTuple):
     m_f:    np.ndarray  # (T_f, d) filtered means
     P_f:    np.ndarray  # (T_f, d) filtered diag variances
@@ -114,17 +116,8 @@ def joint_kf_rts_moments(
     P0_jm = (sig_v**2) / np.maximum(2*lam, eps)
 
     # ----- window centres → fine-time map (T_f, max_k_per_t) with -1 padding -----
-    centres_sec = offset_sec + np.arange(K) * win_sec
-    t_c_idx = np.clip(np.round(centres_sec / delta_spk).astype(np.int64), 0, T_f-1)
-    buckets = [[] for _ in range(T_f)]
-    for k in range(K):
-        buckets[int(t_c_idx[k])].append(k)
-    kcount = np.array([len(b) for b in buckets], dtype=np.int32)
-    max_k = int(kcount.max(initial=0))
-    t2k = np.full((T_f, max_k), -1, dtype=np.int32)
-    for t in range(T_f):
-        row = buckets[t]
-        if row: t2k[t, :len(row)] = np.asarray(row, dtype=np.int32)
+    centres_sec = centres_from_win(K, win_sec, offset_sec)
+    t2k, kcount = build_t2k(centres_sec, delta_spk, T_f)
 
     # ----- per-train spike pseudo-observations -----
     ωeff = np.maximum(np.asarray(omega_S, np.float64), omega_floor)       # (S,T_f)

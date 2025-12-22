@@ -53,12 +53,6 @@ def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.nda
 
 
 @jax.jit
-def _build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
-    T = latent_reim.shape[0]
-    return jnp.concatenate([jnp.ones((T, 1)), latent_reim], axis=1)
-
-
-@jax.jit
 def _compute_psi_all(
     X_RTP: jnp.ndarray,
     beta_S: jnp.ndarray,
