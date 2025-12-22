@@ -192,6 +192,66 @@ def _print_shrinkage_diagnostics(
             # print(f"  s={s} f={freq:.1f}Hz: shrink={sf:.3f} {status}")
 
 
+def _compute_spike_band_weights(
+    shrink_factors: np.ndarray,
+    aggregation: str = "mean",
+    floor: float = 0.01,
+    verbose: bool = True,
+    freqs_hz: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """
+    Compute per-band weights for spike observation from shrinkage factors.
+
+    Args:
+        shrink_factors: (S, J) shrinkage factors per neuron/band
+        aggregation: How to aggregate across neurons - "mean", "min", "max"
+        floor: Minimum weight to prevent numerical issues
+        verbose: Print diagnostic information
+        freqs_hz: Frequency labels for diagnostics
+
+    Returns:
+        weights: (J,) per-band weights in [floor, 1.0]
+    """
+    S, J = shrink_factors.shape
+
+    if aggregation == "mean":
+        weights = shrink_factors.mean(axis=0)
+    elif aggregation == "min":
+        weights = shrink_factors.min(axis=0)
+    elif aggregation == "max":
+        weights = shrink_factors.max(axis=0)
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+
+    # Apply floor
+    weights = np.clip(weights, floor, 1.0)
+
+    if verbose:
+        print(f"[SPIKE-WEIGHTS] Band-specific spike observation weights (aggregation={aggregation}):")
+        print(f"[SPIKE-WEIGHTS]   Range: [{weights.min():.4f}, {weights.max():.4f}]")
+        print(f"[SPIKE-WEIGHTS]   Mean:  {weights.mean():.4f}")
+
+        # Categorize bands
+        strong = weights > 0.5
+        weak = weights < 0.1
+        n_strong = strong.sum()
+        n_weak = weak.sum()
+        n_mid = J - n_strong - n_weak
+
+        print(f"[SPIKE-WEIGHTS]   Categories: {n_strong} strong (>0.5), {n_mid} moderate, {n_weak} weak (<0.1)")
+
+        if freqs_hz is not None:
+            # Print per-band details for extreme cases
+            if n_weak > 0:
+                weak_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if weights[j] < 0.1]
+                print(f"[SPIKE-WEIGHTS]   Weak bands (LFP-dominated): {', '.join(weak_freqs)}")
+            if n_strong > 0 and n_strong <= 5:
+                strong_freqs = [f"{freqs_hz[j]:.1f}Hz(w={weights[j]:.2f})" for j in range(J) if weights[j] > 0.5]
+                print(f"[SPIKE-WEIGHTS]   Strong bands: {', '.join(strong_freqs)}")
+
+    return weights
+
+
 # ========================= Prior helpers =========================
 
 def _reduce_mu(mu_raw: Optional[np.ndarray], L: int) -> np.ndarray:
@@ -419,9 +479,14 @@ class InferenceTrialsHierConfig:
     min_latent_std: float = 0.01
     # Memory optimization
     trace_thin: int = 2
-    # Beta shrinkage (NEW)
+    # Beta shrinkage
     use_beta_shrinkage: bool = True
     beta_shrinkage_burn_in: float = 0.5
+    # Band-specific spike weighting
+    use_spike_band_weights: bool = True          # Enable band-specific weighting
+    spike_weight_floor: float = 0.01             # Minimum weight (prevents exact zero)
+    spike_weight_aggregation: str = "mean"       # How to aggregate across neurons: "mean", "min", "max"
+    verbose_band_weights: bool = True            # Print band weight diagnostics
 
 
 # ========================= EM adapters =========================
@@ -551,6 +616,7 @@ def run_joint_inference_trials_hier(
     print(f"[HIER-JOINT] freeze_beta0 = {config.freeze_beta0}")
     print(f"[HIER-JOINT] standardize_latents = {config.standardize_latents}")
     print(f"[HIER-JOINT] use_beta_shrinkage = {config.use_beta_shrinkage}")
+    print(f"[HIER-JOINT] use_spike_band_weights = {config.use_spike_band_weights}")
     print(f"[HIER-JOINT] trace_thin = {config.trace_thin}")
     print(f"[HIER-JOINT] Using TWO-PASS hierarchical KF refresh:")
     print(f"[HIER-JOINT]   Pass 1: Pooled → X (shared)")
@@ -657,7 +723,8 @@ def run_joint_inference_trials_hier(
     trace.theta_D = [theta_D]
     trace.X_fine = []
     trace.D_fine = []
-    trace.shrinkage_factors = []  # NEW: store shrinkage diagnostics
+    trace.shrinkage_factors = []  # store shrinkage diagnostics
+    trace.spike_band_weights = []  # store band-specific spike weights
     
     # Track D variance fraction over refreshes
     D_fraction = 0.0
@@ -771,7 +838,7 @@ def run_joint_inference_trials_hier(
         inner_gamma_hist = np.stack(inner_gamma_hist, axis=0)
 
         # =================================================================
-        # BETA SHRINKAGE (NEW)
+        # BETA SHRINKAGE + BAND WEIGHTS
         # =================================================================
         if config.use_beta_shrinkage:
             beta_mean, shrink_factors = _apply_beta_shrinkage(
@@ -779,8 +846,22 @@ def run_joint_inference_trials_hier(
             )
             _print_shrinkage_diagnostics(shrink_factors, all_freqs, max_neurons=2)
             trace.shrinkage_factors.append(shrink_factors)
+
+            # Compute band-specific weights for spike observations
+            if config.use_spike_band_weights:
+                spike_band_weights = _compute_spike_band_weights(
+                    shrink_factors,
+                    aggregation=config.spike_weight_aggregation,
+                    floor=config.spike_weight_floor,
+                    verbose=config.verbose_band_weights,
+                    freqs_hz=all_freqs,
+                )
+                trace.spike_band_weights.append(spike_band_weights.copy())
+            else:
+                spike_band_weights = None
         else:
             beta_mean = np.mean(inner_beta_hist, axis=0)
+            spike_band_weights = None
         
         gamma_shared_for_refresh = np.median(inner_gamma_hist, axis=0).mean(axis=1)
         beta = jnp.asarray(beta_mean)
@@ -819,6 +900,7 @@ def run_joint_inference_trials_hier(
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=True,   # Pool LFP for X
             pool_spike_trials=True, # Pool spikes for X
+            spike_band_weights=spike_band_weights,  # band-specific weighting
         )
         
         # When pooled, all trials have same estimate - take first
@@ -849,6 +931,7 @@ def run_joint_inference_trials_hier(
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=False,   # Per-trial LFP
             pool_spike_trials=False, # Per-trial spikes
+            spike_band_weights=spike_band_weights,  # band-specific weighting
         )
         
         Z_fine_kf = mom_Z.m_s[:, :T0, :]  # (R, T, 2*J*M)
