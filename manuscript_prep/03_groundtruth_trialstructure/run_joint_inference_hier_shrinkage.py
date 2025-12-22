@@ -41,32 +41,38 @@ class JointInferenceHierConfig:
     tol: float = 1e-3
     sig_eps_init: float = 5.0
     log_every: int = 1000
-    
+
     # MCMC parameters
     fixed_iter: int = 500
     n_refreshes: int = 10
     inner_steps_per_refresh: int = 100
-    
+
     # Regularization
     omega_floor: float = 1e-3
     sigma_u: float = 0.1
-    
+
     # Spectrogram
     window_sec: float = 0.4
     NW_product: int = 1
-    
+
     # Frequency grid
     freq_min: float = 1.0
     freq_max: float = 61.0
     freq_step: float = 2.0
-    
+
     # Memory optimization
     trace_thin: int = 2
     save_checkpoints: bool = False
-    
+
     # Beta shrinkage
     use_beta_shrinkage: bool = True
     beta_shrinkage_burn_in: float = 0.5
+
+    # Band-specific spike weighting
+    use_spike_band_weights: bool = True
+    spike_weight_floor: float = 0.01
+    spike_weight_aggregation: str = "mean"
+    verbose_band_weights: bool = True
 
 
 def compute_multitaper_spectrogram(lfp: np.ndarray, fs: float, freqs: np.ndarray,
@@ -169,11 +175,16 @@ def trace_to_dict(trace, thin: int = 1) -> dict:
     if hasattr(trace, 'latent_scale_factors'):
         trace_out['latent_scale_factors'] = np.asarray(trace.latent_scale_factors)
     
-    # Shrinkage factors (NEW)
+    # Shrinkage factors
     if hasattr(trace, 'shrinkage_factors') and len(trace.shrinkage_factors) > 0:
         trace_out['shrinkage_factors'] = np.asarray(trace.shrinkage_factors)
         # print(f"  [TRACE] shrinkage_factors: {trace_out['shrinkage_factors'].shape}")
-    
+
+    # Spike band weights
+    if hasattr(trace, 'spike_band_weights') and len(trace.spike_band_weights) > 0:
+        trace_out['spike_band_weights'] = np.asarray(trace.spike_band_weights)
+        print(f"  [TRACE] spike_band_weights: {trace_out['spike_band_weights'].shape}")
+
     return trace_out
 
 
@@ -208,6 +219,10 @@ def run_joint_inference_hier_wrapper(
     print(f"  Beta shrinkage: {config.use_beta_shrinkage}")
     if config.use_beta_shrinkage:
         print(f"  Shrinkage burn-in: {config.beta_shrinkage_burn_in}")
+    print(f"  Spike band weights: {config.use_spike_band_weights}")
+    if config.use_spike_band_weights:
+        print(f"  Spike weight floor: {config.spike_weight_floor}")
+        print(f"  Spike weight aggregation: {config.spike_weight_aggregation}")
     
     # Compute spectrogram
     print("Computing multitaper spectrogram...")
@@ -235,6 +250,11 @@ def run_joint_inference_hier_wrapper(
         # Beta shrinkage
         use_beta_shrinkage=config.use_beta_shrinkage,
         beta_shrinkage_burn_in=config.beta_shrinkage_burn_in,
+        # Band-specific spike weighting
+        use_spike_band_weights=config.use_spike_band_weights,
+        spike_weight_floor=config.spike_weight_floor,
+        spike_weight_aggregation=config.spike_weight_aggregation,
+        verbose_band_weights=config.verbose_band_weights,
         em_kwargs=dict(
             max_iter=config.max_iter,
             tol=config.tol,
@@ -379,7 +399,16 @@ def main():
                         help='Disable beta shrinkage')
     parser.add_argument('--shrinkage_burn_in', type=float, default=0.5,
                         help='Burn-in fraction for shrinkage computation')
-    
+    parser.add_argument('--no_spike_band_weights', action='store_true',
+                        help='Disable band-specific spike weighting')
+    parser.add_argument('--spike_weight_floor', type=float, default=0.01,
+                        help='Minimum weight for spike band weighting')
+    parser.add_argument('--spike_weight_aggregation', type=str, default='mean',
+                        choices=['mean', 'min', 'max'],
+                        help='How to aggregate shrinkage across neurons')
+    parser.add_argument('--quiet_band_weights', action='store_true',
+                        help='Suppress band weight diagnostics')
+
     args = parser.parse_args()
     
     # Load data
@@ -401,6 +430,10 @@ def main():
         trace_thin=args.trace_thin,
         use_beta_shrinkage=not args.no_shrinkage,
         beta_shrinkage_burn_in=args.shrinkage_burn_in,
+        use_spike_band_weights=not args.no_spike_band_weights,
+        spike_weight_floor=args.spike_weight_floor,
+        spike_weight_aggregation=args.spike_weight_aggregation,
+        verbose_band_weights=not args.quiet_band_weights,
     )
     
     # Run inference

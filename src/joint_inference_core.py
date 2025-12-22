@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from src.utils_common import centres_from_win, build_t2k
 
@@ -82,6 +82,7 @@ def joint_kf_rts_moments(
     *,
     sigma_u: float = 0.0,
     omega_floor: float = 1e-6,
+    spike_band_weights: Optional[np.ndarray] = None,  # (J,) weights per band
 ) -> JointMoments:
     J, M, K = Y_cube.shape
 
@@ -143,6 +144,15 @@ def joint_kf_rts_moments(
              beta_pairs[..., 1][:, None, :] * s_tbl.T[None, :, :]) / float(M)
     b_tbl = (-beta_pairs[..., 0][:, None, :] * s_tbl.T[None, :, :] +
               beta_pairs[..., 1][:, None, :] * c_tbl.T[None, :, :]) / float(M)
+
+    # Apply band-specific weights to spike observation coefficients
+    # This scales Kalman gains: uncoupled bands (w_j ≈ 0) get no spike updates
+    if spike_band_weights is not None:
+        w = np.asarray(spike_band_weights, dtype=np.float64)  # (J,)
+        assert w.shape == (J,), f"spike_band_weights must be (J,)={J}, got {w.shape}"
+        # Broadcast: (S, T, J) * (1, 1, J)
+        a_tbl = a_tbl * w[None, None, :]
+        b_tbl = b_tbl * w[None, None, :]
 
     # real/imag observations as real arrays
     Yre = np.ascontiguousarray(np.real(Y_cube), dtype=np.float64)      # (J,M,K)

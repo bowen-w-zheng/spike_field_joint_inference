@@ -136,6 +136,7 @@ def joint_kf_rts_moments_trials_fast(
     sig_eps_trials: Optional[np.ndarray] = None,  # (R,J,M)
     pool_lfp_trials: bool = False,
     pool_spike_trials: bool = False,
+    spike_band_weights: Optional[np.ndarray] = None,  # (J,) weights per band
 ) -> TrialMoments:
     """
     Trial-aware KF/RTS smoother.
@@ -229,6 +230,7 @@ def joint_kf_rts_moments_trials_fast(
             H_hist=H_STL,                # (S,T,L)
             sigma_u=sigma_u,
             omega_floor=omega_floor,
+            spike_band_weights=spike_band_weights,  # pass through band weights
         )
         return np.asarray(mom.m_s), np.asarray(mom.P_s)  # ensure NumPy outward
 
