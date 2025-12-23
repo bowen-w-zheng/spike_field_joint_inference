@@ -233,7 +233,8 @@ def run_ctssmt_lfp_only(lfp: np.ndarray, fs: float, config: CTSSMTConfig,
     # Squeeze tfr if it has taper dimension
     if tfr.ndim == 4:
         tfr = tfr.squeeze(axis=2)  # (R, J, T)
-    
+    for j, freq in enumerate(freqs):
+        print(f"{freq:.0f} Hz: λ_X = {lam_X[j, 0]:.4f}")
     return {
         'Z_smooth_full': Z_smooth_full,     # (R, J, T) - trial-specific latent Z = X + D
         'Z_mean_fine': Z_mean_fine,         # (R, J, M, T_fine) - fine grid with tapers
