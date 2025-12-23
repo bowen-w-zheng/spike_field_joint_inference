@@ -192,64 +192,125 @@ def _print_shrinkage_diagnostics(
             # print(f"  s={s} f={freq:.1f}Hz: shrink={sf:.3f} {status}")
 
 
-def _compute_spike_band_weights(
-    shrink_factors: np.ndarray,
-    aggregation: str = "mean",
-    floor: float = 0.01,
+# ========================= Wald Test Band Selection =========================
+
+def _wald_test_band_selection(
+    beta_samples: np.ndarray,
+    J: int,
+    alpha: float = 0.05,
+    burn_in_frac: float = 0.5,
     verbose: bool = True,
     freqs_hz: Optional[Sequence[float]] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute per-band weights for spike observation from shrinkage factors.
+    Perform Wald test to select bands with significant spike coupling.
+
+    Tests H0: β_j = 0 (no coupling) for each band j.
 
     Args:
-        shrink_factors: (S, J) shrinkage factors per neuron/band
-        aggregation: How to aggregate across neurons - "mean", "min", "max"
-        floor: Minimum weight to prevent numerical issues
-        verbose: Print diagnostic information
+        beta_samples: (n_samples, S, P) MCMC samples, P = 1 + 2*J
+        J: Number of frequency bands
+        alpha: Significance level (default 0.05)
+        burn_in_frac: Fraction of samples to discard as burn-in
+        verbose: Print diagnostic output
         freqs_hz: Frequency labels for diagnostics
 
     Returns:
-        weights: (J,) per-band weights in [floor, 1.0]
+        significant_mask: (J,) bool array - True if band is significantly coupled
+        W_stats: (S, J) Wald statistics per neuron/band
+        p_values: (S, J) p-values per neuron/band
     """
-    S, J = shrink_factors.shape
+    from scipy import stats
 
-    if aggregation == "mean":
-        weights = shrink_factors.mean(axis=0)
-    elif aggregation == "min":
-        weights = shrink_factors.min(axis=0)
-    elif aggregation == "max":
-        weights = shrink_factors.max(axis=0)
-    else:
-        raise ValueError(f"Unknown aggregation: {aggregation}")
+    n_samples, S, P = beta_samples.shape
 
-    # Apply floor
-    weights = np.clip(weights, floor, 1.0)
+    # Apply burn-in
+    burn_in = int(burn_in_frac * n_samples)
+    samples = beta_samples[burn_in:]
+    n_post = samples.shape[0]
+
+    # Extract β_R and β_I for each band
+    # Layout: [β₀, βR_0, ..., βR_{J-1}, βI_0, ..., βI_{J-1}]
+    beta_R = samples[:, :, 1:1+J]        # (n_post, S, J)
+    beta_I = samples[:, :, 1+J:1+2*J]    # (n_post, S, J)
+
+    # Posterior means and variances
+    mean_R = beta_R.mean(axis=0)  # (S, J)
+    mean_I = beta_I.mean(axis=0)  # (S, J)
+    var_R = beta_R.var(axis=0)    # (S, J)
+    var_I = beta_I.var(axis=0)    # (S, J)
+
+    # Wald statistic: W = β̂_R²/Var(β_R) + β̂_I²/Var(β_I) ~ χ²(2)
+    W_stats = np.zeros((S, J))
+    p_values = np.zeros((S, J))
+
+    for s in range(S):
+        for j in range(J):
+            if var_R[s, j] > 1e-10 and var_I[s, j] > 1e-10:
+                W_stats[s, j] = (mean_R[s, j]**2 / var_R[s, j] +
+                                mean_I[s, j]**2 / var_I[s, j])
+                p_values[s, j] = 1 - stats.chi2.cdf(W_stats[s, j], df=2)
+            else:
+                W_stats[s, j] = 0.0
+                p_values[s, j] = 1.0
+
+    # Band is significant if ANY neuron shows significance
+    significant_mask = (p_values < alpha).any(axis=0)  # (J,)
 
     if verbose:
-        print(f"[SPIKE-WEIGHTS] Band-specific spike observation weights (aggregation={aggregation}):")
-        print(f"[SPIKE-WEIGHTS]   Range: [{weights.min():.4f}, {weights.max():.4f}]")
-        print(f"[SPIKE-WEIGHTS]   Mean:  {weights.mean():.4f}")
-
-        # Categorize bands
-        strong = weights > 0.5
-        weak = weights < 0.1
-        n_strong = strong.sum()
-        n_weak = weak.sum()
-        n_mid = J - n_strong - n_weak
-
-        print(f"[SPIKE-WEIGHTS]   Categories: {n_strong} strong (>0.5), {n_mid} moderate, {n_weak} weak (<0.1)")
+        n_sig = significant_mask.sum()
+        print(f"[WALD] Band selection (α={alpha}, burn-in={burn_in_frac}):")
+        print(f"[WALD]   Using {n_post} post-burn-in samples")
+        print(f"[WALD]   Significant bands: {n_sig}/{J}")
 
         if freqs_hz is not None:
-            # Print per-band details for extreme cases
-            if n_weak > 0:
-                weak_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if weights[j] < 0.1]
-                print(f"[SPIKE-WEIGHTS]   Weak bands (LFP-dominated): {', '.join(weak_freqs)}")
-            if n_strong > 0 and n_strong <= 5:
-                strong_freqs = [f"{freqs_hz[j]:.1f}Hz(w={weights[j]:.2f})" for j in range(J) if weights[j] > 0.5]
-                print(f"[SPIKE-WEIGHTS]   Strong bands: {', '.join(strong_freqs)}")
+            sig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if significant_mask[j]]
+            nonsig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if not significant_mask[j]]
 
-    return weights
+            if sig_freqs:
+                print(f"[WALD]   Coupled (spike+LFP): {', '.join(sig_freqs)}")
+            if nonsig_freqs and len(nonsig_freqs) <= 10:
+                print(f"[WALD]   Uncoupled (LFP-only): {', '.join(nonsig_freqs)}")
+            elif nonsig_freqs:
+                print(f"[WALD]   Uncoupled (LFP-only): {len(nonsig_freqs)} bands")
+
+        # Per-band details (only for significant bands)
+        if n_sig > 0 and n_sig <= 10:
+            print(f"[WALD]   Significant band details:")
+            for j in range(J):
+                if significant_mask[j]:
+                    min_p = p_values[:, j].min()
+                    max_W = W_stats[:, j].max()
+                    freq_str = f"{freqs_hz[j]:.1f}Hz" if freqs_hz is not None else f"band {j}"
+                    print(f"[WALD]     {freq_str}: W_max={max_W:.2f}, p_min={min_p:.2e}")
+
+    return significant_mask, W_stats, p_values
+
+
+def _zero_nonsignificant_beta(
+    beta: np.ndarray,
+    significant_mask: np.ndarray,
+    J: int,
+) -> np.ndarray:
+    """
+    Set β coefficients to zero for bands without significant coupling.
+
+    Args:
+        beta: (S, P) array where P = 1 + 2*J
+        significant_mask: (J,) boolean - True for significant bands
+        J: Number of frequency bands
+
+    Returns:
+        beta_masked: (S, P) with non-significant bands zeroed
+    """
+    beta_masked = beta.copy()
+
+    for j in range(J):
+        if not significant_mask[j]:
+            beta_masked[:, 1 + j] = 0.0        # β_R,j = 0
+            beta_masked[:, 1 + J + j] = 0.0    # β_I,j = 0
+
+    return beta_masked
 
 
 # ========================= Prior helpers =========================
@@ -482,11 +543,11 @@ class InferenceTrialsHierConfig:
     # Beta shrinkage
     use_beta_shrinkage: bool = True
     beta_shrinkage_burn_in: float = 0.5
-    # Band-specific spike weighting
-    use_spike_band_weights: bool = True          # Enable band-specific weighting
-    spike_weight_floor: float = 0.01             # Minimum weight (prevents exact zero)
-    spike_weight_aggregation: str = "mean"       # How to aggregate across neurons: "mean", "min", "max"
-    verbose_band_weights: bool = True            # Print band weight diagnostics
+    # Wald test band selection
+    use_wald_band_selection: bool = True
+    wald_alpha: float = 0.05
+    wald_burn_in_frac: float = 0.5
+    verbose_wald: bool = True
 
 
 # ========================= EM adapters =========================
@@ -616,7 +677,7 @@ def run_joint_inference_trials_hier(
     print(f"[HIER-JOINT] freeze_beta0 = {config.freeze_beta0}")
     print(f"[HIER-JOINT] standardize_latents = {config.standardize_latents}")
     print(f"[HIER-JOINT] use_beta_shrinkage = {config.use_beta_shrinkage}")
-    print(f"[HIER-JOINT] use_spike_band_weights = {config.use_spike_band_weights}")
+    print(f"[HIER-JOINT] use_wald_band_selection = {config.use_wald_band_selection}")
     print(f"[HIER-JOINT] trace_thin = {config.trace_thin}")
     print(f"[HIER-JOINT] Using TWO-PASS hierarchical KF refresh:")
     print(f"[HIER-JOINT]   Pass 1: Pooled → X (shared)")
@@ -724,7 +785,6 @@ def run_joint_inference_trials_hier(
     trace.X_fine = []
     trace.D_fine = []
     trace.shrinkage_factors = []  # store shrinkage diagnostics
-    trace.spike_band_weights = []  # store band-specific spike weights
     
     # Track D variance fraction over refreshes
     D_fraction = 0.0
@@ -795,6 +855,35 @@ def run_joint_inference_trials_hier(
     gc.collect()
     print(f"[HIER-JOINT] Warmup trace stored, memory freed")
 
+    # =================================================================
+    # WALD TEST FOR BAND SELECTION (after warmup)
+    # =================================================================
+    if config.use_wald_band_selection:
+        print("[HIER-JOINT] Performing Wald test for band selection...")
+
+        # Stack all warmup beta samples
+        beta_samples_warmup = np.stack(trace.beta, axis=0)  # (n_warmup, S, P)
+
+        significant_mask, W_stats, p_values = _wald_test_band_selection(
+            beta_samples=beta_samples_warmup,
+            J=J,
+            alpha=config.wald_alpha,
+            burn_in_frac=config.wald_burn_in_frac,
+            verbose=config.verbose_wald,
+            freqs_hz=all_freqs,
+        )
+
+        # Store in trace for diagnostics
+        trace.wald_significant_mask = significant_mask
+        trace.wald_W_stats = W_stats
+        trace.wald_p_values = p_values
+
+        n_significant = significant_mask.sum()
+        print(f"[HIER-JOINT] {n_significant}/{J} bands will receive spike updates")
+    else:
+        significant_mask = np.ones(J, dtype=bool)  # All bands coupled
+        print("[HIER-JOINT] Wald test disabled - all bands receive spike updates")
+
     # 5) Refresh passes using NON-HIERARCHICAL KF (treats Z = X + D jointly)
     sidx = StateIndex(J, M)
     print(f"[HIER-JOINT] Starting {config.n_refreshes} refresh passes (non-hierarchical KF)...")
@@ -838,7 +927,7 @@ def run_joint_inference_trials_hier(
         inner_gamma_hist = np.stack(inner_gamma_hist, axis=0)
 
         # =================================================================
-        # BETA SHRINKAGE + BAND WEIGHTS
+        # BETA SHRINKAGE
         # =================================================================
         if config.use_beta_shrinkage:
             beta_mean, shrink_factors = _apply_beta_shrinkage(
@@ -846,28 +935,27 @@ def run_joint_inference_trials_hier(
             )
             _print_shrinkage_diagnostics(shrink_factors, all_freqs, max_neurons=2)
             trace.shrinkage_factors.append(shrink_factors)
-
-            # Compute band-specific weights for spike observations
-            if config.use_spike_band_weights:
-                spike_band_weights = _compute_spike_band_weights(
-                    shrink_factors,
-                    aggregation=config.spike_weight_aggregation,
-                    floor=config.spike_weight_floor,
-                    verbose=config.verbose_band_weights,
-                    freqs_hz=all_freqs,
-                )
-                trace.spike_band_weights.append(spike_band_weights.copy())
-            else:
-                spike_band_weights = None
         else:
             beta_mean = np.mean(inner_beta_hist, axis=0)
-            spike_band_weights = None
         
         gamma_shared_for_refresh = np.median(inner_gamma_hist, axis=0).mean(axis=1)
         beta = jnp.asarray(beta_mean)
 
         # Rescale β to original units for KF refresh
         beta_mean_original = _rescale_beta(beta_mean, latent_scale_factors) if config.standardize_latents else beta_mean
+
+        # =================================================================
+        # APPLY WALD MASK: Zero β for non-significant bands
+        # =================================================================
+        if config.use_wald_band_selection:
+            beta_for_kf = _zero_nonsignificant_beta(
+                beta_mean_original, significant_mask, J
+            )
+            if config.verbose_wald and rr == 0:  # Only print on first refresh
+                n_active = significant_mask.sum()
+                print(f"[HIER-JOINT] KF refresh using {n_active}/{J} coupled bands")
+        else:
+            beta_for_kf = beta_mean_original
 
         # =================================================================
         # TWO-PASS HIERARCHICAL KF REFRESH
@@ -888,7 +976,7 @@ def run_joint_inference_trials_hier(
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_mean_original,
+            beta=beta_for_kf,  # Use masked beta (non-significant bands zeroed)
             gamma_shared=np.asarray(gamma_shared_for_refresh),
             spikes=spikes_SRT,
             omega=np.asarray(omega_SRT),
@@ -900,7 +988,6 @@ def run_joint_inference_trials_hier(
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=True,   # Pool LFP for X
             pool_spike_trials=True, # Pool spikes for X
-            spike_band_weights=spike_band_weights,  # band-specific weighting
         )
         
         # When pooled, all trials have same estimate - take first
@@ -919,7 +1006,7 @@ def run_joint_inference_trials_hier(
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_mean_original,
+            beta=beta_for_kf,  # Use masked beta (non-significant bands zeroed)
             gamma_shared=np.asarray(gamma_shared_for_refresh),
             spikes=spikes_SRT,
             omega=np.asarray(omega_SRT),
@@ -931,7 +1018,6 @@ def run_joint_inference_trials_hier(
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=False,   # Per-trial LFP
             pool_spike_trials=False, # Per-trial spikes
-            spike_band_weights=spike_band_weights,  # band-specific weighting
         )
         
         Z_fine_kf = mom_Z.m_s[:, :T0, :]  # (R, T, 2*J*M)
