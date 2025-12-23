@@ -82,7 +82,6 @@ def joint_kf_rts_moments(
     *,
     sigma_u: float = 0.0,
     omega_floor: float = 1e-6,
-    spike_psi_offset: Optional[np.ndarray] = None,  # (S, T_f) offset to subtract from yspk
 ) -> JointMoments:
     J, M, K = Y_cube.shape
 
@@ -126,10 +125,6 @@ def joint_kf_rts_moments(
     hist = np.einsum('str,sr->st', np.asarray(H_S[:,:T_f,:], np.float64), np.asarray(gamma_S, np.float64))  # (S,T)
     yspk = np.clip((κ / ωeff) - beta_S[:, [0]] - np.where(np.isfinite(hist), hist, 0.0), -1e6, 1e6)         # (S,T)
     Rspk = (1.0 / ωeff) + float(sigma_u)**2                                                                     # (S,T)
-
-    # === DEVIATION MODE: subtract β·X̃ offset from spike pseudo-observations ===
-    if spike_psi_offset is not None:
-        yspk = yspk - spike_psi_offset  # Now observes β·D̃, not β·Z̃
 
     # ----- carriers + per-time weights a_s(t), b_s(t); NO Hspk -----
     freqs_for_phase = np.asarray(freqs_for_phase, np.float64)
