@@ -136,6 +136,8 @@ def joint_kf_rts_moments_trials_fast(
     sig_eps_trials: Optional[np.ndarray] = None,  # (R,J,M)
     pool_lfp_trials: bool = False,
     pool_spike_trials: bool = False,
+    X_fine_estimate: Optional[np.ndarray] = None,  # (T, 2*J*M) for residual mode
+    estimate_residual: bool = False,               # If True, estimate D (residual of Z - X)
 ) -> TrialMoments:
     """
     Trial-aware KF/RTS smoother.
@@ -229,6 +231,8 @@ def joint_kf_rts_moments_trials_fast(
             H_hist=H_STL,                # (S,T,L)
             sigma_u=sigma_u,
             omega_floor=omega_floor,
+            X_fine_estimate=X_fine_estimate,
+            estimate_residual=estimate_residual,
         )
         return np.asarray(mom.m_s), np.asarray(mom.P_s)  # ensure NumPy outward
 
