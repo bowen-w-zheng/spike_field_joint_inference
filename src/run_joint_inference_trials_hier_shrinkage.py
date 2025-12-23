@@ -1062,12 +1062,12 @@ def run_joint_inference_trials_hier(
         X_var_updated = mom_X.P_s[0, :T0, :]    # (T, 2*J*M)
 
         # -----------------------------------------------------------------
-        # PASS 2: Estimate D_r (per-trial residual) using RESIDUAL observations
+        # PASS 2: Estimate D_r (deviation) directly using RESIDUAL observations
         # Residual LFP: Y_r - X̂
         # Residual spikes: yspk - β·X̃
         # Uses θ_D dynamics (faster, trial-specific)
         # -----------------------------------------------------------------
-        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating D_r (residual mode)")
+        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating D_r (deviation mode)")
 
         mom_D = joint_kf_rts_moments_trials_fast(
             Y_trials=Y_trials,
@@ -1085,10 +1085,11 @@ def run_joint_inference_trials_hier(
             H_hist=H_hist_for_kf,
             sigma_u=config.sigma_u,
             sig_eps_trials=sig_eps_trials,
-            pool_lfp_trials=False,   # Per-trial LFP
-            pool_spike_trials=False, # Per-trial spikes
-            X_fine_estimate=X_fine_updated,  # Pass X for residual computation
-            estimate_residual=True,           # Enable residual mode
+            pool_lfp_trials=False,   # Per-trial LFP residuals
+            pool_spike_trials=False, # Per-trial spike residuals
+            X_fine_estimate=X_fine_updated,   # X̂ from Pass 1
+            X_var_estimate=X_var_updated,     # Var(X̂) from Pass 1
+            estimate_deviation=True,          # Enable deviation mode
         )
 
         # D_r is the direct output (already the residual)
