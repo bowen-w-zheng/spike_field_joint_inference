@@ -113,8 +113,101 @@ def _gamma_default(S: int, L: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main trial-aware refresh (always supports per-trial Z; optional X/D)
+# Deviation mode helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_X_at_block_centers(
+    X_fine: np.ndarray,      # (T_fine, 2*J*M)
+    delta_spk: float,
+    win_sec: float,
+    offset_sec: float,
+    K: int,                  # number of LFP blocks
+) -> np.ndarray:
+    """Extract X̂ values at LFP block centers for residual computation.
+
+    Returns: (K, 2*J*M) array of X values at block centers
+    """
+    T_fine = X_fine.shape[0]
+    centres_sec = offset_sec + np.arange(K) * win_sec
+    t_idx = np.clip(np.round((centres_sec - offset_sec) / delta_spk).astype(int), 0, T_fine - 1)
+    return X_fine[t_idx, :]  # (K, 2*J*M)
+
+
+def _compute_X_tilde_at_spike_times(
+    X_fine: np.ndarray,           # (T_fine, 2*J*M)
+    freqs_for_phase: np.ndarray,  # (J,)
+    delta_spk: float,
+    offset_sec: float,
+    J: int,
+    M: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute rotated, taper-averaged X̃ for spike pseudo-observation subtraction.
+
+    X̃ = e^{iωt} * (1/M) Σ_m X_m
+
+    Returns:
+        X_tilde_R: (T_fine, J) - real part of e^{iωt} * X̄
+        X_tilde_I: (T_fine, J) - imag part
+    """
+    T_fine = X_fine.shape[0]
+
+    # Reshape X_fine to (T_fine, J, M, 2) for Re/Im access
+    X_reshaped = X_fine.reshape(T_fine, J, M, 2)
+    X_re = X_reshaped[..., 0]  # (T_fine, J, M)
+    X_im = X_reshaped[..., 1]  # (T_fine, J, M)
+
+    # Taper average
+    X_bar_re = X_re.mean(axis=2)  # (T_fine, J)
+    X_bar_im = X_im.mean(axis=2)  # (T_fine, J)
+
+    # Rotation: X̃ = e^{iωt} * X_bar
+    t = offset_sec + np.arange(T_fine) * delta_spk
+    freqs = np.asarray(freqs_for_phase)
+    theta = 2.0 * np.pi * freqs[None, :] * t[:, None]  # (T_fine, J)
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    # e^{iθ}(R + iI) = (R cos θ - I sin θ) + i(R sin θ + I cos θ)
+    X_tilde_R = X_bar_re * cos_theta - X_bar_im * sin_theta  # (T_fine, J)
+    X_tilde_I = X_bar_re * sin_theta + X_bar_im * cos_theta  # (T_fine, J)
+
+    return X_tilde_R, X_tilde_I
+
+
+def _compute_beta_X_contribution(
+    X_fine: np.ndarray,           # (T_fine, 2*J*M)
+    beta_interleaved: np.ndarray, # (S, 1+2*J) interleaved [β₀, βR_0, βI_0, ...]
+    freqs_for_phase: np.ndarray,  # (J,)
+    delta_spk: float,
+    offset_sec: float,
+    J: int,
+    M: int,
+) -> np.ndarray:
+    """Compute β·X̃ contribution to subtract from spike pseudo-observations.
+
+    Returns: (S, T_fine) array of β·X̃ values
+    """
+    S = beta_interleaved.shape[0]
+    T_fine = X_fine.shape[0]
+
+    # Get X̃ (rotated, taper-averaged)
+    X_tilde_R, X_tilde_I = _compute_X_tilde_at_spike_times(
+        X_fine, freqs_for_phase, delta_spk, offset_sec, J, M
+    )  # (T_fine, J)
+
+    # Extract β_R and β_I from interleaved format
+    # Layout: [β₀, βR_0, βI_0, βR_1, βI_1, ...]
+    beta_R_sj = np.zeros((S, J), dtype=float)
+    beta_I_sj = np.zeros((S, J), dtype=float)
+    for j in range(J):
+        beta_R_sj[:, j] = beta_interleaved[:, 1 + 2*j]
+        beta_I_sj[:, j] = beta_interleaved[:, 1 + 2*j + 1]
+
+    # β·X̃ for each (s, t): Σ_j (β_R,j * X̃_R,j + β_I,j * X̃_I,j)
+    beta_X_contribution = np.einsum('sj,tj->st', beta_R_sj, X_tilde_R) + \
+                          np.einsum('sj,tj->st', beta_I_sj, X_tilde_I)
+
+    return beta_X_contribution  # (S, T_fine)
 
 def joint_kf_rts_moments_trials_fast(
     Y_trials: np.ndarray,
@@ -136,8 +229,9 @@ def joint_kf_rts_moments_trials_fast(
     sig_eps_trials: Optional[np.ndarray] = None,  # (R,J,M)
     pool_lfp_trials: bool = False,
     pool_spike_trials: bool = False,
-    X_fine_estimate: Optional[np.ndarray] = None,  # (T, 2*J*M) for residual mode
-    estimate_residual: bool = False,               # If True, estimate D (residual of Z - X)
+    X_fine_estimate: Optional[np.ndarray] = None,  # (T_fine, 2*J*M) from Pass 1
+    X_var_estimate: Optional[np.ndarray] = None,   # (T_fine, 2*J*M) variance of X̂
+    estimate_deviation: bool = False,              # If True, estimate D (deviation) not Z
 ) -> TrialMoments:
     """
     Trial-aware KF/RTS smoother.
@@ -210,13 +304,44 @@ def joint_kf_rts_moments_trials_fast(
     beta_use = np.median(beta, axis=1) if beta.ndim == 3 else np.asarray(beta, float)  # (S,P)
     beta_use = separated_to_interleaved(beta_use)  # Convert to interleaved for joint_kf_rts_moments
 
+    # === DEVIATION MODE SETUP ===
+    # Compute quantities to subtract when estimating D instead of Z
+    X_block_JMK = None        # X̂ at LFP block centers (J, M, K)
+    spike_psi_offset = None   # β·X̃ contribution to spike pseudo-obs (S, T_fine)
+
+    if estimate_deviation:
+        if X_fine_estimate is None:
+            raise ValueError("X_fine_estimate required when estimate_deviation=True")
+
+        freqs_arr = np.asarray(freqs_for_phase, dtype=float)
+
+        # 1. For LFP: compute X̂ at block centers
+        X_at_blocks = _extract_X_at_block_centers(
+            X_fine_estimate, delta_spk, win_sec, offset_sec, K
+        )  # (K, 2*J*M)
+
+        # Reshape to (K, J, M, 2) then to (J, M, K) complex for subtraction
+        X_block_reshaped = X_at_blocks.reshape(K, J, M, 2)
+        X_block_complex = X_block_reshaped[..., 0] + 1j * X_block_reshaped[..., 1]  # (K,J,M)
+        X_block_JMK = np.moveaxis(X_block_complex, 0, 2)  # (J, M, K)
+
+        # 2. For spikes: compute β·X̃ to subtract from pseudo-observation
+        spike_psi_offset = _compute_beta_X_contribution(
+            X_fine_estimate, beta_use, freqs_arr, delta_spk, offset_sec, J, M
+        )  # (S, T_fine)
+
     # Single-trial smoother caller
     def _run_single_trial(
         Y_r: np.ndarray, theta_r: OUParams,
         spikes_ST: np.ndarray, omega_ST: np.ndarray, H_STL: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
+        # In deviation mode, subtract X from LFP
+        Y_r_use = Y_r
+        if estimate_deviation and X_block_JMK is not None:
+            Y_r_use = Y_r - X_block_JMK  # Y_residual = Y - X̂
+
         mom = joint_kf_rts_moments(
-            Y_cube=Y_r,
+            Y_cube=Y_r_use,
             theta=theta_r,
             delta_spk=delta_spk,
             win_sec=win_sec,
@@ -231,8 +356,7 @@ def joint_kf_rts_moments_trials_fast(
             H_hist=H_STL,                # (S,T,L)
             sigma_u=sigma_u,
             omega_floor=omega_floor,
-            X_fine_estimate=X_fine_estimate,
-            estimate_residual=estimate_residual,
+            spike_psi_offset=spike_psi_offset,  # β·X̃ to subtract from yspk
         )
         return np.asarray(mom.m_s), np.asarray(mom.P_s)  # ensure NumPy outward
 
