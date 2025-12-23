@@ -348,6 +348,52 @@ def _select_significant_neurons(
     return neuron_mask
 
 
+def _zero_nonsignificant_beta_per_neuron(
+    beta: np.ndarray,
+    p_values: np.ndarray,
+    J: int,
+    alpha: float = 0.05,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Zero β[s,j] when neuron s is NOT significantly coupled to band j.
+
+    This prevents uncoupled spike trains from influencing band estimates
+    in the Kalman filter.
+
+    Args:
+        beta: (S, P) where P = 1 + 2*J, in SEPARATED layout
+        p_values: (S, J) per-neuron, per-band p-values
+        J: number of frequency bands
+        alpha: significance threshold
+        verbose: print diagnostics
+
+    Returns:
+        beta_masked: (S, P) with non-significant coefficients zeroed
+        significant_pairs: (S, J) boolean mask of significant pairs
+    """
+    S, P = beta.shape
+    assert P == 1 + 2 * J, f"Expected P={1+2*J}, got {P}"
+    assert p_values.shape == (S, J), f"Expected p_values shape ({S},{J}), got {p_values.shape}"
+
+    beta_masked = beta.copy()
+    significant_pairs = p_values < alpha  # (S, J) boolean
+
+    for s in range(S):
+        for j in range(J):
+            if not significant_pairs[s, j]:
+                # SEPARATED layout: βR at 1+j, βI at 1+J+j
+                beta_masked[s, 1 + j] = 0.0          # β_R[s,j] = 0
+                beta_masked[s, 1 + J + j] = 0.0      # β_I[s,j] = 0
+
+    if verbose:
+        n_zeroed = (~significant_pairs).sum()
+        n_sig = significant_pairs.sum()
+        print(f"[GATING] {n_sig}/{S*J} (neuron,band) pairs significant, {n_zeroed} zeroed")
+
+    return beta_masked, significant_pairs
+
+
 # ========================= Prior helpers =========================
 
 def _reduce_mu(mu_raw: Optional[np.ndarray], L: int) -> np.ndarray:
@@ -1006,30 +1052,20 @@ def run_joint_inference_trials_hier(
         # =================================================================
         # TWO-PASS HIERARCHICAL KF REFRESH
         # Pass 1: Pooled observations → X (shared component)
-        # Pass 2: Residual observations → D_r (per-trial deviation)
-        # Then: Z_r = X + D_r
+        # Pass 2: Per-trial observations → Z_r (full per-trial latent)
+        # Then: D_r = Z_r - X
         # =================================================================
 
         # -----------------------------------------------------------------
-        # FILTER: Only include significant neurons in spike observations
+        # PER-(NEURON, BAND) GATING: Zero β[s,j] for non-significant pairs
+        # This prevents uncoupled spike trains from affecting band estimates
         # -----------------------------------------------------------------
-        if neuron_mask.all():
-            # All neurons significant, no filtering needed
-            spikes_for_kf = spikes_SRT
-            omega_for_kf = np.asarray(omega_SRT)
-            beta_for_kf_filtered = beta_for_kf
-            gamma_for_kf = np.asarray(gamma_shared_for_refresh)
-            H_hist_for_kf = H_SRTL
+        if config.use_wald_band_selection:
+            beta_for_kf_gated, _ = _zero_nonsignificant_beta_per_neuron(
+                beta_for_kf, p_values, J, alpha=config.wald_alpha, verbose=(rr == 0)
+            )
         else:
-            # Filter to significant neurons only
-            sig_neuron_idx = np.where(neuron_mask)[0]
-            spikes_for_kf = spikes_SRT[sig_neuron_idx]
-            omega_for_kf = np.asarray(omega_SRT)[sig_neuron_idx]
-            beta_for_kf_filtered = beta_for_kf[sig_neuron_idx]
-            gamma_for_kf = np.asarray(gamma_shared_for_refresh)[sig_neuron_idx]
-            H_hist_for_kf = H_SRTL[sig_neuron_idx] if H_SRTL is not None else None
-            if rr == 0:
-                print(f"[HIER-JOINT] Filtering to {len(sig_neuron_idx)}/{S} significant neurons")
+            beta_for_kf_gated = beta_for_kf
 
         # -----------------------------------------------------------------
         # PASS 1: Estimate X (shared) using POOLED observations
@@ -1043,14 +1079,14 @@ def run_joint_inference_trials_hier(
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf_filtered,
-            gamma_shared=gamma_for_kf,
-            spikes=spikes_for_kf,
-            omega=omega_for_kf,
+            beta=beta_for_kf_gated,
+            gamma_shared=np.asarray(gamma_shared_for_refresh),
+            spikes=spikes_SRT,
+            omega=np.asarray(omega_SRT),
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx,
-            H_hist=H_hist_for_kf,
+            H_hist=H_SRTL,
             sigma_u=config.sigma_u,
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=True,   # Pool LFP for X
@@ -1062,43 +1098,42 @@ def run_joint_inference_trials_hier(
         X_var_updated = mom_X.P_s[0, :T0, :]    # (T, 2*J*M)
 
         # -----------------------------------------------------------------
-        # PASS 2: Estimate D_r (deviation) directly using RESIDUAL observations
-        # Residual LFP: Y_r - X̂
-        # Residual spikes: yspk - β·X̃
-        # Uses θ_D dynamics (faster, trial-specific)
+        # PASS 2: Estimate Z_r (per-trial) using PER-TRIAL observations
+        # Each trial's LFP and spikes inform its own Z_r = X + D_r
         # -----------------------------------------------------------------
-        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating D_r (deviation mode)")
+        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating Z_r (per-trial)")
 
-        mom_D = joint_kf_rts_moments_trials_fast(
+        mom_Z = joint_kf_rts_moments_trials_fast(
             Y_trials=Y_trials,
-            theta=theta_D,  # Use D dynamics (faster, trial-specific)
+            theta=theta_D,  # Use D dynamics for trial-specific component
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf_filtered,
-            gamma_shared=gamma_for_kf,
-            spikes=spikes_for_kf,
-            omega=omega_for_kf,
+            beta=beta_for_kf_gated,
+            gamma_shared=np.asarray(gamma_shared_for_refresh),
+            spikes=spikes_SRT,
+            omega=np.asarray(omega_SRT),
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx,
-            H_hist=H_hist_for_kf,
+            H_hist=H_SRTL,
             sigma_u=config.sigma_u,
             sig_eps_trials=sig_eps_trials,
-            pool_lfp_trials=False,   # Per-trial LFP residuals
-            pool_spike_trials=False, # Per-trial spike residuals
-            X_fine_estimate=X_fine_updated,   # X̂ from Pass 1
-            X_var_estimate=X_var_updated,     # Var(X̂) from Pass 1
-            estimate_deviation=True,          # Enable deviation mode
+            pool_lfp_trials=False,   # Per-trial LFP
+            pool_spike_trials=False, # Per-trial spikes
         )
 
-        # D_r is the direct output (already the residual)
-        D_fine_updated = mom_D.m_s[:, :T0, :]  # (R, T, 2*J*M)
-        D_var_updated = mom_D.P_s[:, :T0, :]   # (R, T, 2*J*M)
+        Z_fine_kf = mom_Z.m_s[:, :T0, :]  # (R, T, 2*J*M)
+        Z_var_kf = mom_Z.P_s[:, :T0, :]   # (R, T, 2*J*M)
 
-        # Reconstruct Z_r = X + D_r for downstream use
-        Z_fine_kf = X_fine_updated[None, :, :] + D_fine_updated  # (R, T, 2*J*M)
-        Z_var_kf = X_var_updated[None, :, :] + D_var_updated     # (R, T, 2*J*M)
+        # -----------------------------------------------------------------
+        # DECOMPOSE: D_r = Z_r - X
+        # -----------------------------------------------------------------
+        D_fine_updated = Z_fine_kf - X_fine_updated[None, :, :]  # (R, T, 2*J*M)
+
+        # Variance of D_r: Var(Z_r - X) ≈ Var(Z_r) + Var(X)
+        # (conservative, treats as independent)
+        D_var_updated = Z_var_kf + X_var_updated[None, :, :]  # (R, T, 2*J*M)
         
         # Compute and print D contribution statistics
         D_power = np.mean(D_fine_updated**2)
