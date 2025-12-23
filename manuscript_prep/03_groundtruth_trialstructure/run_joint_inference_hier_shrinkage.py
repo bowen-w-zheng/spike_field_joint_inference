@@ -68,11 +68,10 @@ class JointInferenceHierConfig:
     use_beta_shrinkage: bool = True
     beta_shrinkage_burn_in: float = 0.5
 
-    # Band-specific spike weighting
-    use_spike_band_weights: bool = True
-    spike_weight_floor: float = 0.01
-    spike_weight_aggregation: str = "mean"
-    verbose_band_weights: bool = True
+    # Wald test band selection
+    use_wald_band_selection: bool = True
+    wald_alpha: float = 0.05
+    verbose_wald: bool = True
 
 
 def compute_multitaper_spectrogram(lfp: np.ndarray, fs: float, freqs: np.ndarray,
@@ -180,10 +179,18 @@ def trace_to_dict(trace, thin: int = 1) -> dict:
         trace_out['shrinkage_factors'] = np.asarray(trace.shrinkage_factors)
         # print(f"  [TRACE] shrinkage_factors: {trace_out['shrinkage_factors'].shape}")
 
-    # Spike band weights
-    if hasattr(trace, 'spike_band_weights') and len(trace.spike_band_weights) > 0:
-        trace_out['spike_band_weights'] = np.asarray(trace.spike_band_weights)
-        print(f"  [TRACE] spike_band_weights: {trace_out['spike_band_weights'].shape}")
+    # Wald test results
+    if hasattr(trace, 'wald_significant_mask'):
+        trace_out['wald_significant_mask'] = np.asarray(trace.wald_significant_mask)
+        print(f"  [TRACE] wald_significant_mask: {trace_out['wald_significant_mask'].shape}")
+
+    if hasattr(trace, 'wald_W_stats'):
+        trace_out['wald_W_stats'] = np.asarray(trace.wald_W_stats)
+        print(f"  [TRACE] wald_W_stats: {trace_out['wald_W_stats'].shape}")
+
+    if hasattr(trace, 'wald_p_values'):
+        trace_out['wald_p_values'] = np.asarray(trace.wald_p_values)
+        print(f"  [TRACE] wald_p_values: {trace_out['wald_p_values'].shape}")
 
     return trace_out
 
@@ -219,10 +226,9 @@ def run_joint_inference_hier_wrapper(
     print(f"  Beta shrinkage: {config.use_beta_shrinkage}")
     if config.use_beta_shrinkage:
         print(f"  Shrinkage burn-in: {config.beta_shrinkage_burn_in}")
-    print(f"  Spike band weights: {config.use_spike_band_weights}")
-    if config.use_spike_band_weights:
-        print(f"  Spike weight floor: {config.spike_weight_floor}")
-        print(f"  Spike weight aggregation: {config.spike_weight_aggregation}")
+    print(f"  Wald band selection: {config.use_wald_band_selection}")
+    if config.use_wald_band_selection:
+        print(f"  Wald alpha: {config.wald_alpha}")
     
     # Compute spectrogram
     print("Computing multitaper spectrogram...")
@@ -250,11 +256,10 @@ def run_joint_inference_hier_wrapper(
         # Beta shrinkage
         use_beta_shrinkage=config.use_beta_shrinkage,
         beta_shrinkage_burn_in=config.beta_shrinkage_burn_in,
-        # Band-specific spike weighting
-        use_spike_band_weights=config.use_spike_band_weights,
-        spike_weight_floor=config.spike_weight_floor,
-        spike_weight_aggregation=config.spike_weight_aggregation,
-        verbose_band_weights=config.verbose_band_weights,
+        # Wald test band selection
+        use_wald_band_selection=config.use_wald_band_selection,
+        wald_alpha=config.wald_alpha,
+        verbose_wald=config.verbose_wald,
         em_kwargs=dict(
             max_iter=config.max_iter,
             tol=config.tol,
@@ -399,15 +404,12 @@ def main():
                         help='Disable beta shrinkage')
     parser.add_argument('--shrinkage_burn_in', type=float, default=0.5,
                         help='Burn-in fraction for shrinkage computation')
-    parser.add_argument('--no_spike_band_weights', action='store_true',
-                        help='Disable band-specific spike weighting')
-    parser.add_argument('--spike_weight_floor', type=float, default=0.01,
-                        help='Minimum weight for spike band weighting')
-    parser.add_argument('--spike_weight_aggregation', type=str, default='mean',
-                        choices=['mean', 'min', 'max'],
-                        help='How to aggregate shrinkage across neurons')
-    parser.add_argument('--quiet_band_weights', action='store_true',
-                        help='Suppress band weight diagnostics')
+    parser.add_argument('--no_wald_selection', action='store_true',
+                        help='Disable Wald test band selection (all bands receive spike updates)')
+    parser.add_argument('--wald_alpha', type=float, default=0.05,
+                        help='Significance level for Wald test (default: 0.05)')
+    parser.add_argument('--quiet_wald', action='store_true',
+                        help='Suppress Wald test diagnostic output')
 
     args = parser.parse_args()
     
@@ -430,10 +432,9 @@ def main():
         trace_thin=args.trace_thin,
         use_beta_shrinkage=not args.no_shrinkage,
         beta_shrinkage_burn_in=args.shrinkage_burn_in,
-        use_spike_band_weights=not args.no_spike_band_weights,
-        spike_weight_floor=args.spike_weight_floor,
-        spike_weight_aggregation=args.spike_weight_aggregation,
-        verbose_band_weights=not args.quiet_band_weights,
+        use_wald_band_selection=not args.no_wald_selection,
+        wald_alpha=args.wald_alpha,
+        verbose_wald=not args.quiet_wald,
     )
     
     # Run inference
