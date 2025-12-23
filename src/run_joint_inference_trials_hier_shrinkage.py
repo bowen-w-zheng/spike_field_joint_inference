@@ -1121,8 +1121,8 @@ def run_joint_inference_trials_hier(
         n_accum += 1
         
         # Rebuild regressors from smoothed Z (per-trial)
-        # Use Z from Pass 2 (per-trial estimates)
-        lat_reim_RTP, var_reim_RTP = _reim_from_fine_trials(mom_Z.m_s, mom_Z.P_s, J=J, M=M)
+        # Use reconstructed Z = X + D from the two passes
+        lat_reim_RTP, var_reim_RTP = _reim_from_fine_trials(Z_fine_kf, Z_var_kf, J=J, M=M)
         T0 = min(T0, lat_reim_RTP.shape[1])
         lat_reim_RTP = lat_reim_RTP[:, :T0]
         var_reim_RTP = var_reim_RTP[:, :T0]
