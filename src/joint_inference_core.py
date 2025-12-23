@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from src.utils_common import centres_from_win, build_t2k
 
@@ -65,6 +65,67 @@ if _HAS_NUMBA:
                     P_s[t, i] = 1e-16
         return m_s, P_s
 
+def _compute_X_contribution_to_spikes(
+    X_fine: np.ndarray,           # (T_f, 2*J*M) fine-grid X estimate
+    beta_S: np.ndarray,           # (S, 1+2B) in INTERLEAVED format [β₀, βR_0, βI_0, βR_1, βI_1, ...]
+    freqs_for_phase: np.ndarray,  # (J,) Hz
+    coupled_bands_idx: np.ndarray,  # (B,) indices into 0..J-1
+    delta_spk: float,
+    offset_sec: float,
+    J: int,
+    M: int,
+) -> np.ndarray:
+    """
+    Compute β · X̃ for each time bin (the X contribution to spike linear predictor).
+
+    X̃ = e^{+iωt} X̄ where X̄ is taper-averaged X.
+
+    Returns:
+        X_contrib: (S, T_f) - contribution to subtract from spike pseudo-obs
+    """
+    T_f = X_fine.shape[0]
+    S = beta_S.shape[0]
+    B = len(coupled_bands_idx)
+
+    # Reshape X to (T, J, M, 2) for easier indexing
+    X_reshaped = X_fine.reshape(T_f, J, M, 2)
+
+    # Taper-average: (T, J, 2)
+    X_avg = X_reshaped.mean(axis=2)  # (T, J, 2)
+
+    # Time array (with offset)
+    t = offset_sec + np.arange(T_f, dtype=np.float64) * delta_spk
+
+    # For each coupled band, rotate by e^{+iωt}
+    X_contrib = np.zeros((S, T_f), dtype=np.float64)
+
+    # beta layout (INTERLEAVED): [β₀, βR_0, βI_0, βR_1, βI_1, ...]
+    for b_idx, j in enumerate(coupled_bands_idx):
+        freq = freqs_for_phase[j]
+        phi = 2.0 * np.pi * freq * t  # (T,)
+        cos_phi = np.cos(phi)
+        sin_phi = np.sin(phi)
+
+        # X for this band: Re and Im parts
+        X_re = X_avg[:, j, 0]  # (T,)
+        X_im = X_avg[:, j, 1]  # (T,)
+
+        # X̃ = e^{+iωt} X = (X_re cos - X_im sin) + i(X_re sin + X_im cos)
+        X_tilde_re = X_re * cos_phi - X_im * sin_phi  # (T,)
+        X_tilde_im = X_re * sin_phi + X_im * cos_phi  # (T,)
+
+        # β indices in interleaved format
+        beta_R_idx = 1 + 2 * b_idx
+        beta_I_idx = 1 + 2 * b_idx + 1
+
+        # Contribution: βR · X̃_re + βI · X̃_im for each neuron
+        for s in range(S):
+            X_contrib[s, :] += (beta_S[s, beta_R_idx] * X_tilde_re +
+                               beta_S[s, beta_I_idx] * X_tilde_im)
+
+    return X_contrib  # (S, T_f)
+
+
 def joint_kf_rts_moments(
     Y_cube: np.ndarray,              # (J, M, K) complex, derotated & scaled
     theta,                           # OUParams(.lam, .sig_v, .sig_eps) (J,M)
@@ -82,6 +143,8 @@ def joint_kf_rts_moments(
     *,
     sigma_u: float = 0.0,
     omega_floor: float = 1e-6,
+    X_fine_estimate: Optional[np.ndarray] = None,  # (T_f, 2*J*M) for residual mode
+    estimate_residual: bool = False,               # If True, estimate D (residual of Z - X)
 ) -> JointMoments:
     J, M, K = Y_cube.shape
 
@@ -119,12 +182,40 @@ def joint_kf_rts_moments(
     centres_sec = centres_from_win(K, win_sec, offset_sec)
     t2k, kcount = build_t2k(centres_sec, delta_spk, T_f)
 
+    # === RESIDUAL MODE: LFP ===
+    # Subtract X estimate from LFP observations at window centers
+    if estimate_residual and X_fine_estimate is not None:
+        # Compute fine-time index for each window center
+        k_to_t = np.clip(np.round((centres_sec - offset_sec) / delta_spk).astype(int), 0, T_f - 1)
+
+        # Reshape X_fine to (T, J, M, 2) and extract values at window centers
+        X_at_centres = X_fine_estimate[k_to_t].reshape(K, J, M, 2)  # (K, J, M, 2)
+        X_complex = X_at_centres[..., 0] + 1j * X_at_centres[..., 1]  # (K, J, M)
+
+        # Create residual Y_cube: Y_residual = Y - X_hat
+        Y_cube = Y_cube - X_complex.transpose(1, 2, 0)  # (J, M, K)
+
     # ----- per-train spike pseudo-observations -----
     ωeff = np.maximum(np.asarray(omega_S, np.float64), omega_floor)       # (S,T_f)
     κ    = np.asarray(spikes_S, np.float64) - 0.5                          # (S,T_f)
     hist = np.einsum('str,sr->st', np.asarray(H_S[:,:T_f,:], np.float64), np.asarray(gamma_S, np.float64))  # (S,T)
     yspk = np.clip((κ / ωeff) - beta_S[:, [0]] - np.where(np.isfinite(hist), hist, 0.0), -1e6, 1e6)         # (S,T)
     Rspk = (1.0 / ωeff) + float(sigma_u)**2                                                                     # (S,T)
+
+    # === RESIDUAL MODE: SPIKES ===
+    # Subtract X contribution from spike pseudo-observations
+    if estimate_residual and X_fine_estimate is not None:
+        X_spike_contrib = _compute_X_contribution_to_spikes(
+            X_fine=X_fine_estimate,
+            beta_S=beta_S,
+            freqs_for_phase=np.asarray(freqs_for_phase, np.float64),
+            coupled_bands_idx=np.asarray(coupled_bands_idx, dtype=int),
+            delta_spk=delta_spk,
+            offset_sec=offset_sec,
+            J=J,
+            M=M,
+        )
+        yspk = yspk - X_spike_contrib  # (S, T_f)
 
     # ----- carriers + per-time weights a_s(t), b_s(t); NO Hspk -----
     freqs_for_phase = np.asarray(freqs_for_phase, np.float64)

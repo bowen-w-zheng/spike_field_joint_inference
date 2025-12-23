@@ -313,6 +313,41 @@ def _zero_nonsignificant_beta(
     return beta_masked
 
 
+def _select_significant_neurons(
+    p_values: np.ndarray,
+    alpha: float = 0.05,
+    verbose: bool = True,
+) -> np.ndarray:
+    """
+    Select neurons that show significant coupling to at least one band.
+
+    Args:
+        p_values: (S, J) p-values from Wald test
+        alpha: Significance level
+        verbose: Print diagnostics
+
+    Returns:
+        neuron_mask: (S,) bool - True for neurons to include in KF refresh
+    """
+    S, J = p_values.shape
+
+    # Neuron is significant if coupled to ANY band
+    neuron_mask = (p_values < alpha).any(axis=1)  # (S,)
+
+    if verbose:
+        n_sig = neuron_mask.sum()
+        print(f"[WALD] Neuron selection: {n_sig}/{S} neurons have significant coupling")
+
+        if n_sig < S:
+            excluded = np.where(~neuron_mask)[0]
+            if len(excluded) <= 10:
+                print(f"[WALD]   Excluded neurons (no coupling): {excluded.tolist()}")
+            else:
+                print(f"[WALD]   Excluded neurons: {len(excluded)} total")
+
+    return neuron_mask
+
+
 # ========================= Prior helpers =========================
 
 def _reduce_mu(mu_raw: Optional[np.ndarray], L: int) -> np.ndarray:
@@ -553,12 +588,21 @@ class InferenceTrialsHierConfig:
 # ========================= EM adapters =========================
 
 def _theta_from_em_hier(res, J, M, Rtr):
-    """Extract both θ_X (shared) and θ_D (per-trial) from hierarchical EM."""
+    """Extract θ_X (shared) and θ_D (per-trial residual) from hierarchical EM.
+
+    Returns:
+        theta_X: OUParams for shared component X
+        theta_D: OUParams for per-trial residual D
+        sig_eps_trials: (R, J, M) per-trial observation noise
+
+    Note: theta_Z was removed because Pass 2 now estimates D directly using
+    residual observations (Y - X, spikes - β·X̃) instead of estimating Z.
+    """
     lam_X = np.asarray(getattr(res, "lam_X"), float).reshape(J, M)
     sigv_X = np.asarray(getattr(res, "sigv_X"), float).reshape(J, M)
     lam_D = np.asarray(getattr(res, "lam_D"), float).reshape(J, M)
     sigv_D = np.asarray(getattr(res, "sigv_D"), float).reshape(J, M)
-    
+
     if hasattr(res, "sig_eps_jmr"):
         sig_eps_jmr = np.asarray(res.sig_eps_jmr, float)
         if sig_eps_jmr.shape[0] == 1:
@@ -569,22 +613,16 @@ def _theta_from_em_hier(res, J, M, Rtr):
         sig_eps_trials = np.broadcast_to(sig_eps_mr.T[:, None, :], (Rtr, J, M))
     else:
         sig_eps_trials = np.full((Rtr, J, M), 5.0, float)
-    
+
     # Pool for shared theta
     var_rm = sig_eps_trials ** 2
     w_rm = 1.0 / np.maximum(var_rm, 1e-20)
     var_pool = 1.0 / np.maximum(w_rm.sum(axis=0), 1e-20)
-    
+
     theta_X = OUParams(lam=lam_X, sig_v=sigv_X, sig_eps=np.sqrt(var_pool))
     theta_D = OUParams(lam=lam_D, sig_v=sigv_D, sig_eps=np.sqrt(var_pool))
-    
-    # Combined theta for Z = X + D (use pooled parameters)
-    # Use slower decay (smaller lambda) to capture both shared and trial variability
-    lam_Z = np.minimum(lam_X, lam_D)
-    sigv_Z = np.sqrt(sigv_X**2 + sigv_D**2)  # Combined process noise
-    theta_Z = OUParams(lam=lam_Z, sig_v=sigv_Z, sig_eps=np.sqrt(var_pool))
-    
-    return theta_X, theta_D, theta_Z, sig_eps_trials
+
+    return theta_X, theta_D, sig_eps_trials
 
 
 def _extract_XD_from_upsampled_hier(upsampled, J, M):
@@ -697,11 +735,10 @@ def run_joint_inference_trials_hier(
         em_kwargs.update(config.em_kwargs)
     print("[HIER-JOINT] Running hierarchical EM warm start...")
     res = em_ct_hier_jax(Y_trials=Y_trials, db=window_sec, **em_kwargs)
-    theta_X, theta_D, theta_Z, sig_eps_trials = _theta_from_em_hier(res, J=J, M=M, Rtr=Rtr)
+    theta_X, theta_D, sig_eps_trials = _theta_from_em_hier(res, J=J, M=M, Rtr=Rtr)
     print("[HIER-JOINT] Hierarchical EM complete")
     print(f"[HIER-JOINT] θ_X: λ range [{theta_X.lam.min():.2f}, {theta_X.lam.max():.2f}]")
     print(f"[HIER-JOINT] θ_D: λ range [{theta_D.lam.min():.2f}, {theta_D.lam.max():.2f}]")
-    print(f"[HIER-JOINT] θ_Z (combined): λ range [{theta_Z.lam.min():.2f}, {theta_Z.lam.max():.2f}]")
 
     # 1) Upsample X and D to fine grid
     from src.upsample_ct_hier_fine import upsample_ct_hier_fine
@@ -873,16 +910,25 @@ def run_joint_inference_trials_hier(
             freqs_hz=all_freqs,
         )
 
-        # Store in trace for diagnostics
+        # Store band-level results in trace
         trace.wald_significant_mask = significant_mask
         trace.wald_W_stats = W_stats
         trace.wald_p_values = p_values
 
         n_significant = significant_mask.sum()
         print(f"[HIER-JOINT] {n_significant}/{J} bands will receive spike updates")
+
+        # Neuron selection: only neurons with coupling to at least one band
+        neuron_mask = _select_significant_neurons(
+            p_values=p_values,
+            alpha=config.wald_alpha,
+            verbose=config.verbose_wald,
+        )
+        trace.wald_neuron_mask = neuron_mask
     else:
         significant_mask = np.ones(J, dtype=bool)  # All bands coupled
-        print("[HIER-JOINT] Wald test disabled - all bands receive spike updates")
+        neuron_mask = np.ones(S, dtype=bool)        # All neurons included
+        print("[HIER-JOINT] Wald test disabled - all bands/neurons receive spike updates")
 
     # 5) Refresh passes using NON-HIERARCHICAL KF (treats Z = X + D jointly)
     sidx = StateIndex(J, M)
@@ -960,77 +1006,98 @@ def run_joint_inference_trials_hier(
         # =================================================================
         # TWO-PASS HIERARCHICAL KF REFRESH
         # Pass 1: Pooled observations → X (shared component)
-        # Pass 2: Per-trial observations → Z_r (full per-trial latent)
-        # Then: D_r = Z_r - X
+        # Pass 2: Residual observations → D_r (per-trial deviation)
+        # Then: Z_r = X + D_r
         # =================================================================
-        
+
+        # -----------------------------------------------------------------
+        # FILTER: Only include significant neurons in spike observations
+        # -----------------------------------------------------------------
+        if neuron_mask.all():
+            # All neurons significant, no filtering needed
+            spikes_for_kf = spikes_SRT
+            omega_for_kf = np.asarray(omega_SRT)
+            beta_for_kf_filtered = beta_for_kf
+            gamma_for_kf = np.asarray(gamma_shared_for_refresh)
+            H_hist_for_kf = H_SRTL
+        else:
+            # Filter to significant neurons only
+            sig_neuron_idx = np.where(neuron_mask)[0]
+            spikes_for_kf = spikes_SRT[sig_neuron_idx]
+            omega_for_kf = np.asarray(omega_SRT)[sig_neuron_idx]
+            beta_for_kf_filtered = beta_for_kf[sig_neuron_idx]
+            gamma_for_kf = np.asarray(gamma_shared_for_refresh)[sig_neuron_idx]
+            H_hist_for_kf = H_SRTL[sig_neuron_idx] if H_SRTL is not None else None
+            if rr == 0:
+                print(f"[HIER-JOINT] Filtering to {len(sig_neuron_idx)}/{S} significant neurons")
+
         # -----------------------------------------------------------------
         # PASS 1: Estimate X (shared) using POOLED observations
         # Since E[D_r] = 0, pooling gives optimal estimate of X
         # -----------------------------------------------------------------
         print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 1 - estimating X (pooled)")
-        
+
         mom_X = joint_kf_rts_moments_trials_fast(
             Y_trials=Y_trials,
             theta=theta_X,  # Use X dynamics (slower, shared)
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf,  # Use masked beta (non-significant bands zeroed)
-            gamma_shared=np.asarray(gamma_shared_for_refresh),
-            spikes=spikes_SRT,
-            omega=np.asarray(omega_SRT),
+            beta=beta_for_kf_filtered,
+            gamma_shared=gamma_for_kf,
+            spikes=spikes_for_kf,
+            omega=omega_for_kf,
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx,
-            H_hist=H_SRTL,
+            H_hist=H_hist_for_kf,
             sigma_u=config.sigma_u,
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=True,   # Pool LFP for X
             pool_spike_trials=True, # Pool spikes for X
         )
-        
+
         # When pooled, all trials have same estimate - take first
         X_fine_updated = mom_X.m_s[0, :T0, :]   # (T, 2*J*M)
         X_var_updated = mom_X.P_s[0, :T0, :]    # (T, 2*J*M)
-        
+
         # -----------------------------------------------------------------
-        # PASS 2: Estimate Z_r (per-trial) using PER-TRIAL observations
-        # Each trial's LFP and spikes inform its own Z_r = X + D_r
+        # PASS 2: Estimate D_r (per-trial residual) using RESIDUAL observations
+        # Residual LFP: Y_r - X̂
+        # Residual spikes: yspk - β·X̃
+        # Uses θ_D dynamics (faster, trial-specific)
         # -----------------------------------------------------------------
-        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating Z_r (per-trial)")
-        
-        mom_Z = joint_kf_rts_moments_trials_fast(
+        print(f"[HIER-JOINT] Refresh {rr + 1}: Pass 2 - estimating D_r (residual mode)")
+
+        mom_D = joint_kf_rts_moments_trials_fast(
             Y_trials=Y_trials,
-            theta=theta_Z,  # Use combined Z dynamics
+            theta=theta_D,  # Use D dynamics (faster, trial-specific)
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf,  # Use masked beta (non-significant bands zeroed)
-            gamma_shared=np.asarray(gamma_shared_for_refresh),
-            spikes=spikes_SRT,
-            omega=np.asarray(omega_SRT),
+            beta=beta_for_kf_filtered,
+            gamma_shared=gamma_for_kf,
+            spikes=spikes_for_kf,
+            omega=omega_for_kf,
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx,
-            H_hist=H_SRTL,
+            H_hist=H_hist_for_kf,
             sigma_u=config.sigma_u,
             sig_eps_trials=sig_eps_trials,
             pool_lfp_trials=False,   # Per-trial LFP
             pool_spike_trials=False, # Per-trial spikes
+            X_fine_estimate=X_fine_updated,  # Pass X for residual computation
+            estimate_residual=True,           # Enable residual mode
         )
-        
-        Z_fine_kf = mom_Z.m_s[:, :T0, :]  # (R, T, 2*J*M)
-        Z_var_kf = mom_Z.P_s[:, :T0, :]   # (R, T, 2*J*M)
-        
-        # -----------------------------------------------------------------
-        # DECOMPOSE: D_r = Z_r - X
-        # -----------------------------------------------------------------
-        D_fine_updated = Z_fine_kf - X_fine_updated[None, :, :]  # (R, T, 2*J*M)
-        
-        # Variance of D_r: Var(Z_r - X) ≈ Var(Z_r) + Var(X) 
-        # (conservative, treats as independent)
-        D_var_updated = Z_var_kf + X_var_updated[None, :, :]  # (R, T, 2*J*M)
+
+        # D_r is the direct output (already the residual)
+        D_fine_updated = mom_D.m_s[:, :T0, :]  # (R, T, 2*J*M)
+        D_var_updated = mom_D.P_s[:, :T0, :]   # (R, T, 2*J*M)
+
+        # Reconstruct Z_r = X + D_r for downstream use
+        Z_fine_kf = X_fine_updated[None, :, :] + D_fine_updated  # (R, T, 2*J*M)
+        Z_var_kf = X_var_updated[None, :, :] + D_var_updated     # (R, T, 2*J*M)
         
         # Compute and print D contribution statistics
         D_power = np.mean(D_fine_updated**2)
