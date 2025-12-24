@@ -5,15 +5,17 @@
 #   shrink[j] = |E[β_j]|² / (|E[β_j]|² + Var(β_j))
 #   Attenuates uncertain frequency components before KF refresh.
 #
+# WITH TRUE BAND GATING:
+#   - Wald test identifies significant (neuron, band) pairs
+#   - Pair-specific β masking: only significant pairs contribute to spike obs
+#   - True band gating: uncoupled bands keep LFP-only (EM) estimates
+#   - This prevents over-smoothing of uncoupled bands
+#
 # TWO-PASS HIERARCHICAL KF REFRESH:
 #   Pass 1: Pooled observations → X (shared component)
 #   Pass 2: Per-trial observations → Z_r (full per-trial latent)  
 #   Then: D_r = Z_r - X
 #
-# This properly separates:
-#   - X: dynamics shared across all trials (informed by pooled observations)
-#   - D_r: trial-specific deviations (informed by each trial's own observations)
-# 
 # MEMORY-OPTIMIZED VERSION:
 # - Only keeps latest X_fine, D_fine, latent (not every refresh)
 # - Thins beta/gamma trace during accumulation
@@ -50,6 +52,12 @@ def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.nda
     keys = jr.split(key, N)
     omega = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi)
     return jnp.maximum(omega, omega_floor)
+
+
+@jax.jit
+def _build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
+    T = latent_reim.shape[0]
+    return jnp.concatenate([jnp.ones((T, 1), dtype=latent_reim.dtype), latent_reim], axis=1)
 
 
 @jax.jit
@@ -182,14 +190,7 @@ def _print_shrinkage_diagnostics(
     max_neurons: int = 2,
 ) -> None:
     """Print shrinkage diagnostics for each frequency."""
-    S, J = shrink_factors.shape
-    # print("[SHRINKAGE] Beta shrinkage diagnostics:")
-    for s in range(min(S, max_neurons)):
-        for j in range(J):
-            freq = freqs_hz[j]
-            sf = shrink_factors[s, j]
-            # status = "SIGNAL" if sf > 0.5 else "(noise)"
-            # print(f"  s={s} f={freq:.1f}Hz: shrink={sf:.3f} {status}")
+    pass  # Silenced for cleaner output
 
 
 # ========================= Wald Test Band Selection =========================
@@ -203,38 +204,27 @@ def _wald_test_band_selection(
     freqs_hz: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Perform Wald test to select bands with significant spike coupling.
+    Perform Wald test to select (neuron, band) pairs with significant spike coupling.
 
-    Tests H0: β_j = 0 (no coupling) for each band j.
-
-    Args:
-        beta_samples: (n_samples, S, P) MCMC samples, P = 1 + 2*J
-        J: Number of frequency bands
-        alpha: Significance level (default 0.05)
-        burn_in_frac: Fraction of samples to discard as burn-in
-        verbose: Print diagnostic output
-        freqs_hz: Frequency labels for diagnostics
+    Tests H0: β_j = 0 (no coupling) for each (neuron, band) pair.
 
     Returns:
-        significant_mask: (J,) bool array - True if band is significantly coupled
-        W_stats: (S, J) Wald statistics per neuron/band
-        p_values: (S, J) p-values per neuron/band
+        significant_mask: (J,) bool - True if ANY neuron is significantly coupled to band
+        W_stats: (S, J) Wald statistics per (neuron, band)
+        p_values: (S, J) p-values per (neuron, band)
     """
     from scipy import stats
 
     n_samples, S, P = beta_samples.shape
 
-    # Apply burn-in
     burn_in = int(burn_in_frac * n_samples)
     samples = beta_samples[burn_in:]
     n_post = samples.shape[0]
 
-    # Extract β_R and β_I for each band
     # Layout: [β₀, βR_0, ..., βR_{J-1}, βI_0, ..., βI_{J-1}]
     beta_R = samples[:, :, 1:1+J]        # (n_post, S, J)
     beta_I = samples[:, :, 1+J:1+2*J]    # (n_post, S, J)
 
-    # Posterior means and variances
     mean_R = beta_R.mean(axis=0)  # (S, J)
     mean_I = beta_I.mean(axis=0)  # (S, J)
     var_R = beta_R.var(axis=0)    # (S, J)
@@ -258,59 +248,121 @@ def _wald_test_band_selection(
     significant_mask = (p_values < alpha).any(axis=0)  # (J,)
 
     if verbose:
-        n_sig = significant_mask.sum()
+        n_sig_bands = significant_mask.sum()
+        n_sig_pairs = (p_values < alpha).sum()
+        total_pairs = S * J
         print(f"[WALD] Band selection (α={alpha}, burn-in={burn_in_frac}):")
         print(f"[WALD]   Using {n_post} post-burn-in samples")
-        print(f"[WALD]   Significant bands: {n_sig}/{J}")
+        print(f"[WALD]   Significant (neuron,band) pairs: {n_sig_pairs}/{total_pairs}")
+        print(f"[WALD]   Bands with ANY significant coupling: {n_sig_bands}/{J}")
 
         if freqs_hz is not None:
             sig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if significant_mask[j]]
             nonsig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if not significant_mask[j]]
 
             if sig_freqs:
-                print(f"[WALD]   Coupled (spike+LFP): {', '.join(sig_freqs)}")
+                print(f"[WALD]   Coupled bands (joint KF): {', '.join(sig_freqs)}")
             if nonsig_freqs and len(nonsig_freqs) <= 10:
-                print(f"[WALD]   Uncoupled (LFP-only): {', '.join(nonsig_freqs)}")
+                print(f"[WALD]   Uncoupled bands (LFP-only): {', '.join(nonsig_freqs)}")
             elif nonsig_freqs:
-                print(f"[WALD]   Uncoupled (LFP-only): {len(nonsig_freqs)} bands")
-
-        # Per-band details (only for significant bands)
-        if n_sig > 0 and n_sig <= 10:
-            print(f"[WALD]   Significant band details:")
-            for j in range(J):
-                if significant_mask[j]:
-                    min_p = p_values[:, j].min()
-                    max_W = W_stats[:, j].max()
-                    freq_str = f"{freqs_hz[j]:.1f}Hz" if freqs_hz is not None else f"band {j}"
-                    print(f"[WALD]     {freq_str}: W_max={max_W:.2f}, p_min={min_p:.2e}")
+                print(f"[WALD]   Uncoupled bands (LFP-only): {len(nonsig_freqs)} bands")
 
     return significant_mask, W_stats, p_values
 
 
-def _zero_nonsignificant_beta(
+def _zero_nonsignificant_beta_per_pair(
     beta: np.ndarray,
-    significant_mask: np.ndarray,
+    p_values: np.ndarray,
     J: int,
-) -> np.ndarray:
+    alpha: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Set β coefficients to zero for bands without significant coupling.
-
+    Zero β coefficients for non-significant (neuron, band) pairs.
+    
+    This is PAIR-SPECIFIC: each (s, j) pair is gated independently.
+    
     Args:
         beta: (S, P) array where P = 1 + 2*J
-        significant_mask: (J,) boolean - True for significant bands
+        p_values: (S, J) p-values from Wald test
         J: Number of frequency bands
-
+        alpha: Significance threshold
+        
     Returns:
-        beta_masked: (S, P) with non-significant bands zeroed
+        beta_masked: (S, P) with non-significant pairs zeroed
+        significant_pairs: (S, J) boolean mask of significant pairs
     """
+    S, P = beta.shape
     beta_masked = beta.copy()
+    significant_pairs = p_values < alpha  # (S, J)
+    
+    n_zeroed = 0
+    for s in range(S):
+        for j in range(J):
+            if not significant_pairs[s, j]:
+                beta_masked[s, 1 + j] = 0.0        # β_R,j = 0
+                beta_masked[s, 1 + J + j] = 0.0    # β_I,j = 0
+                n_zeroed += 1
+    
+    n_sig = significant_pairs.sum()
+    print(f"[GATING] β masking: {n_sig}/{S*J} pairs significant, {n_zeroed} zeroed")
+    
+    return beta_masked, significant_pairs
 
+
+def _apply_true_band_gating(
+    Z_fine_kf: np.ndarray,       # (R, T, 2*J*M) from joint KF
+    Z_var_kf: np.ndarray,        # (R, T, 2*J*M) from joint KF
+    Z_fine_lfponly: np.ndarray,  # (R, T, 2*J*M) from LFP-only (EM)
+    Z_var_lfponly: np.ndarray,   # (R, T, 2*J*M) from LFP-only (EM)
+    significant_mask: np.ndarray, # (J,) boolean - True if ANY neuron coupled
+    J: int,
+    M: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    TRUE per-band gating: Use joint KF estimates ONLY for coupled bands.
+    For uncoupled bands (no significant neurons), keep the LFP-only estimates.
+    
+    This prevents over-smoothing of uncoupled bands that occurs when running
+    them through the joint KF with theta_Z dynamics.
+    
+    Args:
+        Z_fine_kf: Joint KF posterior means
+        Z_var_kf: Joint KF posterior variances
+        Z_fine_lfponly: LFP-only (EM) estimates - UNMODIFIED reference
+        Z_var_lfponly: LFP-only (EM) variances
+        significant_mask: (J,) True if band has ANY significant coupling
+        J: Number of frequency bands
+        M: Number of tapers
+        
+    Returns:
+        Z_gated: Hybrid estimates (joint for coupled, LFP-only for uncoupled)
+        Z_var_gated: Corresponding variances
+    """
+    # Start with LFP-only estimates
+    Z_gated = Z_fine_lfponly.copy()
+    Z_var_gated = Z_var_lfponly.copy()
+    
+    n_coupled = 0
+    n_uncoupled = 0
+    
     for j in range(J):
-        if not significant_mask[j]:
-            beta_masked[:, 1 + j] = 0.0        # β_R,j = 0
-            beta_masked[:, 1 + J + j] = 0.0    # β_I,j = 0
-
-    return beta_masked
+        if significant_mask[j]:
+            # This band IS coupled - use joint KF estimates
+            n_coupled += 1
+            for m in range(M):
+                col_re = 2 * (j * M + m)
+                col_im = col_re + 1
+                Z_gated[:, :, col_re] = Z_fine_kf[:, :, col_re]
+                Z_gated[:, :, col_im] = Z_fine_kf[:, :, col_im]
+                Z_var_gated[:, :, col_re] = Z_var_kf[:, :, col_re]
+                Z_var_gated[:, :, col_im] = Z_var_kf[:, :, col_im]
+        else:
+            # This band is NOT coupled - keep LFP-only (already in Z_gated)
+            n_uncoupled += 1
+    
+    print(f"[GATING] State gating: {n_coupled} bands from joint KF, {n_uncoupled} bands from LFP-only")
+    
+    return Z_gated, Z_var_gated
 
 
 def _select_significant_neurons(
@@ -504,99 +556,6 @@ def _rotate_reim_for_spikes(
     return np.concatenate([Re_rot, Im_rot], axis=2), np.concatenate([Vr_rot, Vi_rot], axis=2)
 
 
-# ========================= X/D Decomposition =========================
-
-def _decompose_Z_to_XD_precision_weighted(
-    Z_mean: np.ndarray,
-    Z_var: np.ndarray,
-    theta_D: OUParams,
-    J: int,
-    M: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Precision-weighted decomposition of Z into X (shared) and D (trial-specific).
-    
-    Each trial gives us: m_r = X + D_r + noise, with total variance Σ_D + P_r
-    where Σ_D is the stationary variance of the D process from theta_D.
-    
-    Optimal (precision-weighted) estimate of X:
-        X = [Σ_r (Σ_D + P_r)^{-1}]^{-1} [Σ_r (Σ_D + P_r)^{-1} m_r]
-    
-    This weights trials with lower uncertainty (smaller P_r) more heavily,
-    and accounts for expected D variance from the OU prior.
-    
-    Args:
-        Z_mean: (R, T, D) - KF posterior means per trial
-        Z_var: (R, T, D) - KF posterior variances per trial
-        theta_D: OU parameters for the D (trial-deviation) process
-        J: number of frequency bands
-        M: number of tapers
-        
-    Returns:
-        X_mean: (T, D) - shared component mean
-        X_var: (T, D) - shared component variance  
-        D_mean: (R, T, D) - trial-specific deviation means
-        D_var: (R, T, D) - trial-specific deviation variances
-    """
-    R, T, dim = Z_mean.shape
-    
-    # Compute stationary variance of D from OU parameters
-    # Var(D) = σ²_v / (2λ) for each (j, m) pair
-    lam_D = np.asarray(theta_D.lam, float).flatten()
-    sigv_D = np.asarray(theta_D.sig_v, float).flatten()
-    
-    # Handle different shapes of theta_D parameters
-    if lam_D.size == J:
-        # (J,) -> repeat for each taper
-        lam_D = np.repeat(lam_D, M)
-        sigv_D = np.repeat(sigv_D, M)
-    elif lam_D.size == J * M:
-        # (J, M) flattened -> already correct
-        pass
-    else:
-        raise ValueError(f"Unexpected theta_D.lam shape: {theta_D.lam.shape}")
-    
-    # Stationary variance for each dimension
-    # dim = 2 * J * M, layout: [Re_00, Im_00, Re_01, Im_01, ...]
-    Sigma_D = np.zeros(dim, dtype=float)
-    for jm in range(J * M):
-        var_D_jm = sigv_D[jm]**2 / (2 * np.maximum(lam_D[jm], 1e-6))
-        # Same variance for real and imaginary parts
-        Sigma_D[2 * jm] = var_D_jm
-        Sigma_D[2 * jm + 1] = var_D_jm
-    
-    # Precision-weighted estimation of X
-    X_mean = np.zeros((T, dim), dtype=float)
-    X_var = np.zeros((T, dim), dtype=float)
-    
-    for d in range(dim):
-        # Total variance for each trial: Var(D) + Var(Z_r|data)
-        # Shape: (R, T)
-        total_var = Sigma_D[d] + Z_var[:, :, d]  # (R, T)
-        
-        # Precision (inverse variance) for each trial
-        precision = 1.0 / np.maximum(total_var, 1e-10)  # (R, T)
-        
-        # Total precision across trials at each time point
-        total_precision = precision.sum(axis=0)  # (T,)
-        
-        # Precision-weighted mean: X = Σ_r (prec_r * m_r) / Σ_r prec_r
-        X_mean[:, d] = (precision * Z_mean[:, :, d]).sum(axis=0) / total_precision
-        
-        # Variance of the estimate: Var(X) = 1 / Σ_r prec_r
-        X_var[:, d] = 1.0 / total_precision
-    
-    # D_r = Z_r - X
-    D_mean = Z_mean - X_mean[None, :, :]  # (R, T, D)
-    
-    # Variance of D_r estimate
-    # Var(D_r) ≈ Var(Z_r|data) + Var(X) since they're approximately independent
-    # (conservative estimate that doesn't underestimate uncertainty)
-    D_var = Z_var + X_var[None, :, :]  # (R, T, D)
-    
-    return X_mean, X_var, D_mean, D_var
-
-
 # ========================= Config =========================
 
 @dataclass
@@ -624,7 +583,7 @@ class InferenceTrialsHierConfig:
     # Beta shrinkage
     use_beta_shrinkage: bool = True
     beta_shrinkage_burn_in: float = 0.5
-    # Wald test band selection
+    # Wald test band selection (TRUE GATING)
     use_wald_band_selection: bool = True
     wald_alpha: float = 0.05
     wald_burn_in_frac: float = 0.5
@@ -743,13 +702,10 @@ def run_joint_inference_trials_hier(
     """
     Hierarchical trial-aware joint inference of spike-field coupling.
     
-    WITH BETA SHRINKAGE: Applies empirical Bayes shrinkage to β before KF refresh.
-    This attenuates uncertain frequency components, preventing low-frequency artifacts.
-    
-    TWO-PASS HIERARCHICAL KF REFRESH:
-      Pass 1: Pooled observations → X (shared component)
-      Pass 2: Per-trial observations → Z_r (full per-trial latent)  
-      Then: D_r = Z_r - X
+    WITH TRUE BAND GATING:
+    - Wald test identifies significant (neuron, band) pairs
+    - Pair-specific β masking for spike observations
+    - TRUE band gating: uncoupled bands keep LFP-only (EM) estimates
     
     Returns β in ORIGINAL (non-standardized) units.
     """
@@ -763,9 +719,10 @@ def run_joint_inference_trials_hier(
     print(f"[HIER-JOINT] use_beta_shrinkage = {config.use_beta_shrinkage}")
     print(f"[HIER-JOINT] use_wald_band_selection = {config.use_wald_band_selection}")
     print(f"[HIER-JOINT] trace_thin = {config.trace_thin}")
-    print(f"[HIER-JOINT] Using TWO-PASS hierarchical KF refresh:")
-    print(f"[HIER-JOINT]   Pass 1: Pooled → X (shared)")
-    print(f"[HIER-JOINT]   Pass 2: Per-trial → Z_r, then D_r = Z_r - X")
+    if config.use_wald_band_selection:
+        print(f"[HIER-JOINT] TRUE GATING ENABLED:")
+        print(f"[HIER-JOINT]   - Pair-specific β masking")
+        print(f"[HIER-JOINT]   - Uncoupled bands keep LFP-only estimates")
 
     Rtr, J, M, K = Y_trials.shape
     S, R, T_f = spikes_SRT.shape
@@ -793,7 +750,21 @@ def run_joint_inference_trials_hier(
         Y_trials=Y_trials, res=res, delta_spk=delta_spk,
         win_sec=window_sec, offset_sec=offset_sec, T_f=None
     )
-    X_fine, X_var_fine, D_fine, D_var_fine = _extract_XD_from_upsampled_hier(ups, J=J, M=M)
+    X_fine_em, X_var_fine_em, D_fine_em, D_var_fine_em = _extract_XD_from_upsampled_hier(ups, J=J, M=M)
+    
+    # =====================================================================
+    # STORE EM ESTIMATES AS LFP-ONLY REFERENCE (NEVER MODIFY THESE)
+    # These are used for true band gating - uncoupled bands keep these values
+    # =====================================================================
+    Z_fine_em = X_fine_em[None, :, :] + D_fine_em  # (R, T, 2*J*M)
+    Z_var_em = X_var_fine_em[None, :, :] + D_var_fine_em
+    print(f"[HIER-JOINT] Stored EM estimates as LFP-only reference (shape: {Z_fine_em.shape})")
+    
+    # Working copies that get updated
+    X_fine = X_fine_em.copy()
+    X_var_fine = X_var_fine_em.copy()
+    D_fine = D_fine_em.copy()
+    D_var_fine = D_var_fine_em.copy()
     
     # Z = X + D for regression (THIS IS THE KEY: treat as single latent)
     Z_fine = X_fine[None, :, :] + D_fine  # (R, T, 2*J*M)
@@ -867,7 +838,7 @@ def run_joint_inference_trials_hier(
     trace.theta_D = [theta_D]
     trace.X_fine = []
     trace.D_fine = []
-    trace.shrinkage_factors = []  # store shrinkage diagnostics
+    trace.shrinkage_factors = []  # Store shrinkage diagnostics
     
     # Track D variance fraction over refreshes
     D_fraction = 0.0
@@ -944,9 +915,10 @@ def run_joint_inference_trials_hier(
     if config.use_wald_band_selection:
         print("[HIER-JOINT] Performing Wald test for band selection...")
 
-        # Stack all warmup beta samples
-        beta_samples_warmup = np.stack(trace.beta, axis=0)  # (n_warmup, S, P)
+        # Stack all warmup samples
+        beta_samples_warmup = np.stack(trace.beta, axis=0)
 
+        # Perform Wald test
         significant_mask, W_stats, p_values = _wald_test_band_selection(
             beta_samples=beta_samples_warmup,
             J=J,
@@ -956,29 +928,23 @@ def run_joint_inference_trials_hier(
             freqs_hz=all_freqs,
         )
 
-        # Store band-level results in trace
+        # Store in trace
         trace.wald_significant_mask = significant_mask
         trace.wald_W_stats = W_stats
         trace.wald_p_values = p_values
 
         n_significant = significant_mask.sum()
-        print(f"[HIER-JOINT] {n_significant}/{J} bands will receive spike updates")
-
-        # Neuron selection: only neurons with coupling to at least one band
-        neuron_mask = _select_significant_neurons(
-            p_values=p_values,
-            alpha=config.wald_alpha,
-            verbose=config.verbose_wald,
-        )
-        trace.wald_neuron_mask = neuron_mask
+        print(f"[HIER-JOINT] {n_significant}/{J} bands will use joint KF")
+        print(f"[HIER-JOINT] {J - n_significant}/{J} bands will keep LFP-only (EM) estimates")
     else:
-        significant_mask = np.ones(J, dtype=bool)  # All bands coupled
-        neuron_mask = np.ones(S, dtype=bool)        # All neurons included
-        print("[HIER-JOINT] Wald test disabled - all bands/neurons receive spike updates")
+        # All bands are "significant" -> all go through joint KF
+        significant_mask = np.ones(J, dtype=bool)
+        p_values = np.zeros((S, J))  # All significant
+        print("[HIER-JOINT] Wald test disabled - all bands use joint KF")
 
     # 5) Refresh passes using NON-HIERARCHICAL KF (treats Z = X + D jointly)
     sidx = StateIndex(J, M)
-    print(f"[HIER-JOINT] Starting {config.n_refreshes} refresh passes (non-hierarchical KF)...")
+    print(f"[HIER-JOINT] Starting {config.n_refreshes} refresh passes...")
     
     for rr in range(config.n_refreshes):
         print(f"[HIER-JOINT] Refresh {rr + 1}/{config.n_refreshes}")
@@ -1037,15 +1003,12 @@ def run_joint_inference_trials_hier(
         beta_mean_original = _rescale_beta(beta_mean, latent_scale_factors) if config.standardize_latents else beta_mean
 
         # =================================================================
-        # APPLY WALD MASK: Zero β for non-significant bands
+        # PAIR-SPECIFIC β MASKING: Zero non-significant (neuron, band) pairs
         # =================================================================
         if config.use_wald_band_selection:
-            beta_for_kf = _zero_nonsignificant_beta(
-                beta_mean_original, significant_mask, J
+            beta_for_kf, significant_pairs = _zero_nonsignificant_beta_per_pair(
+                beta_mean_original, p_values, J, alpha=config.wald_alpha
             )
-            if config.verbose_wald and rr == 0:  # Only print on first refresh
-                n_active = significant_mask.sum()
-                print(f"[HIER-JOINT] KF refresh using {n_active}/{J} coupled bands")
         else:
             beta_for_kf = beta_mean_original
 
@@ -1079,7 +1042,7 @@ def run_joint_inference_trials_hier(
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf_gated,
+            beta=beta_for_kf,
             gamma_shared=np.asarray(gamma_shared_for_refresh),
             spikes=spikes_SRT,
             omega=np.asarray(omega_SRT),
@@ -1109,7 +1072,7 @@ def run_joint_inference_trials_hier(
             delta_spk=delta_spk,
             win_sec=window_sec,
             offset_sec=offset_sec,
-            beta=beta_for_kf_gated,
+            beta=beta_for_kf,
             gamma_shared=np.asarray(gamma_shared_for_refresh),
             spikes=spikes_SRT,
             omega=np.asarray(omega_SRT),
@@ -1125,15 +1088,31 @@ def run_joint_inference_trials_hier(
 
         Z_fine_kf = mom_Z.m_s[:, :T0, :]  # (R, T, 2*J*M)
         Z_var_kf = mom_Z.P_s[:, :T0, :]   # (R, T, 2*J*M)
-
+        
+        # =================================================================
+        # TRUE BAND GATING: Keep LFP-only (EM) estimates for uncoupled bands
+        # =================================================================
+        if config.use_wald_band_selection:
+            Z_fine_gated, Z_var_gated = _apply_true_band_gating(
+                Z_fine_kf=Z_fine_kf,
+                Z_var_kf=Z_var_kf,
+                Z_fine_lfponly=Z_fine_em[:, :T0, :],  # Use ORIGINAL EM estimates
+                Z_var_lfponly=Z_var_em[:, :T0, :],
+                significant_mask=significant_mask,
+                J=J, M=M
+            )
+        else:
+            Z_fine_gated = Z_fine_kf
+            Z_var_gated = Z_var_kf
+        
         # -----------------------------------------------------------------
         # DECOMPOSE: D_r = Z_r - X
         # -----------------------------------------------------------------
-        D_fine_updated = Z_fine_kf - X_fine_updated[None, :, :]  # (R, T, 2*J*M)
-
-        # Variance of D_r: Var(Z_r - X) ≈ Var(Z_r) + Var(X)
+        D_fine_updated = Z_fine_gated - X_fine_updated[None, :, :]  # (R, T, 2*J*M)
+        
+        # Variance of D_r: Var(Z_r - X) ≈ Var(Z_r) + Var(X) 
         # (conservative, treats as independent)
-        D_var_updated = Z_var_kf + X_var_updated[None, :, :]  # (R, T, 2*J*M)
+        D_var_updated = Z_var_gated + X_var_updated[None, :, :]  # (R, T, 2*J*M)
         
         # Compute and print D contribution statistics
         D_power = np.mean(D_fine_updated**2)
@@ -1142,7 +1121,7 @@ def run_joint_inference_trials_hier(
         print(f"[HIER-JOINT] X/D decomposition: D variance fraction = {D_fraction:.1f}%")
         
         # Debug: print cross-trial variability
-        Z_trial_std = np.std(Z_fine_kf, axis=0).mean()
+        Z_trial_std = np.std(Z_fine_gated, axis=0).mean()
         print(f"[HIER-JOINT] Z cross-trial std (mean): {Z_trial_std:.6f}")
         
         # Update current X and D
@@ -1156,9 +1135,8 @@ def run_joint_inference_trials_hier(
         D_fine_accum += D_fine_current
         n_accum += 1
         
-        # Rebuild regressors from smoothed Z (per-trial)
-        # Use reconstructed Z = X + D from the two passes
-        lat_reim_RTP, var_reim_RTP = _reim_from_fine_trials(Z_fine_kf, Z_var_kf, J=J, M=M)
+        # Rebuild regressors from GATED smoothed Z (per-trial)
+        lat_reim_RTP, var_reim_RTP = _reim_from_fine_trials(Z_fine_gated, Z_var_gated, J=J, M=M)
         T0 = min(T0, lat_reim_RTP.shape[1])
         lat_reim_RTP = lat_reim_RTP[:, :T0]
         var_reim_RTP = var_reim_RTP[:, :T0]
@@ -1245,5 +1223,9 @@ def run_joint_inference_trials_hier(
     print(f"[HIER-JOINT] Final D variance fraction: {D_fraction:.1f}%")
     if config.use_beta_shrinkage:
         print(f"[HIER-JOINT] Beta shrinkage was ENABLED")
+    if config.use_wald_band_selection:
+        print(f"[HIER-JOINT] TRUE GATING was ENABLED:")
+        print(f"[HIER-JOINT]   - {significant_mask.sum()}/{J} bands used joint KF")
+        print(f"[HIER-JOINT]   - {J - significant_mask.sum()}/{J} bands kept LFP-only")
 
     return beta_final, np.asarray(gamma), theta_X, theta_D, trace

@@ -49,7 +49,7 @@ class JointInferenceHierConfig:
 
     # Regularization
     omega_floor: float = 1e-3
-    sigma_u: float = 0.1
+    sigma_u: float = 1
 
     # Spectrogram
     window_sec: float = 0.4
@@ -65,7 +65,7 @@ class JointInferenceHierConfig:
     save_checkpoints: bool = False
 
     # Beta shrinkage
-    use_beta_shrinkage: bool = True
+    use_beta_shrinkage: bool = False
     beta_shrinkage_burn_in: float = 0.5
 
     # Wald test band selection
