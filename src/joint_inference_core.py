@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from src.utils_common import centres_from_win, build_t2k
 
