@@ -27,7 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 # Import the SHRINKAGE module
-from src.run_joint_inference_trials_hier_shrinkage import (
+from run_joint_inference_trials import (
     run_joint_inference_trials_hier,
     InferenceTrialsHierConfig,
 )
