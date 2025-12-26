@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CLI wrapper for src/em_ct_single_jax.py
+Run NumPy em_ct for comparison with JAX version.
 Usage:
-    python compute_ctssmt_lfp_only_single.py --input ./data/sim.pkl --output ./results/ctssmt.pkl
+    python compute_ctssmt_numpy.py --input ./data/sim.pkl --output ./results/ctssmt_numpy.pkl
 """
 import sys
 import os
@@ -15,9 +15,8 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-import jax.numpy as jnp
 import mne
-from src.em_ct_single_jax import em_ct_single_jax
+from src.em_ct import em_ct
 from src.utils_multitaper import derotate_tfr_align_start
 
 
@@ -31,6 +30,7 @@ def main():
     parser.add_argument('--freq_max', type=float, default=61.0)
     parser.add_argument('--freq_step', type=float, default=2.0)
     parser.add_argument('--window_sec', type=float, default=0.4)
+    parser.add_argument('--freeze_lam_iters', type=int, default=50)
     args = parser.parse_args()
 
     # Load
@@ -39,77 +39,79 @@ def main():
     lfp = data['LFP']
     fs = data.get('fs', 1000.0)
     freqs = np.arange(args.freq_min, args.freq_max, args.freq_step)
-    
-    # Spectrogram
-    NW = 1  # time_bandwidth = 2*NW = 2
+
+    # Spectrogram (same preprocessing as JAX version)
+    NW = 1
     tfr = mne.time_frequency.tfr_array_multitaper(
-        lfp[None, None, :], 
-        sfreq=fs, 
+        lfp[None, None, :],
+        sfreq=fs,
         freqs=freqs,
-        n_cycles=freqs * args.window_sec, 
-        time_bandwidth=2 * NW, 
-        output='complex', 
+        n_cycles=freqs * args.window_sec,
+        time_bandwidth=2 * NW,
+        output='complex',
         zero_mean=False
-    ).squeeze()[:, None, :]  # (J, 1, T) since Kmax=1 taper
-    
+    ).squeeze()[:, None, :]  # (J, 1, T)
+
     M = int(args.window_sec * fs)
     tfr = derotate_tfr_align_start(tfr, freqs, fs, 1, M)
-    
+
     # Taper scaling
     tapers, _ = mne.time_frequency.multitaper.dpss_windows(M, NW, Kmax=1)
     scaling = 2.0 / tapers.sum(axis=1)
     tfr = tfr * scaling[None, :, None]
-    
+
     # Downsample to blocks
     Y_cube = tfr[:, :, ::M]  # (J, M, K)
     J, M_tapers, K = Y_cube.shape
     print(f"Y_cube shape: {Y_cube.shape} (J={J}, M={M_tapers}, K={K})")
-    
-    # Run EM
-    result = em_ct_single_jax(
-        Y=jnp.asarray(Y_cube), 
-        db=args.window_sec, 
+
+    # Run NumPy EM
+    print(f"\nRunning NumPy em_ct (freeze_lam_iters={args.freeze_lam_iters})...")
+    lam, sig_v, sig_eps, ll_hist, xs, Ps = em_ct(
+        Y_cube,
+        db=args.window_sec,
         max_iter=args.max_iter,
         tol=args.tol,
-        verbose=True, 
-        log_every=50
+        verbose=True,
+        freeze_lam_iters=args.freeze_lam_iters,
+        return_moments=True,
     )
-    
-    # Convert to numpy
-    Z_mean = np.asarray(result.Z_mean)  # (J, M, K)
-    Z_var = np.asarray(result.Z_var)    # (J, M, K)
-    lam = np.asarray(result.lam)
-    sigv = np.asarray(result.sigv)
-    sig_eps = np.asarray(result.sig_eps)
-    ll_hist = np.asarray(result.ll_hist)
-    
-    # Z_smooth: average across tapers (for single taper, this is just squeeze)
-    Z_smooth = Z_mean.mean(axis=1)  # (J, K)
-    
+
+    print(f"\nResults:")
+    print(f"  Iterations: {len(ll_hist)}")
+    print(f"  λ range: [{lam.min():.4f}, {lam.max():.4f}]")
+    print(f"  σ_ε: {sig_eps}")
+    print(f"  Final LL: {ll_hist[-1]:.4e}")
+
+    # Print lambda per frequency
+    print(f"\nLambda per frequency:")
+    freqs_true = np.asarray(data.get('freqs_hz', []))
+    for j in range(J):
+        lam_val = lam[j, 0] if lam.ndim > 1 else lam[j]
+        marker = " <-- SIGNAL" if any(np.abs(freqs[j] - freqs_true) < 1) else ""
+        print(f"  {freqs[j]:5.1f} Hz: λ = {lam_val:6.4f}{marker}")
+
     # Save
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'wb') as f:
         pickle.dump({
-            'Y_cube': np.asarray(Y_cube),  # Raw input to EM
-            'Z_smooth': Z_smooth,           # (J, K) smoothed, taper-averaged
-            'Z_mean': Z_mean,               # (J, M, K) smoothed
-            'Z_var': Z_var,                 # (J, M, K) variance
+            'Y_cube': np.asarray(Y_cube),
+            'Z_smooth': xs.mean(axis=1),  # (J, K)
+            'Z_mean': xs,                  # (J, M, K)
+            'Z_var': Ps,                   # (J, M, K)
             'params': {
                 'lam': lam,
-                'sigv': sigv,
+                'sigv': sig_v,
                 'sig_eps': sig_eps,
             },
             'll_hist': ll_hist,
             'freqs': freqs,
             'window_sec': args.window_sec,
             'fs': fs,
+            'method': 'numpy_em_ct',
         }, f)
-    
-    # Print diagnostics
+
     print(f"\nSaved to {args.output}")
-    print(f"  λ range: [{lam.min():.4f}, {lam.max():.4f}]")
-    print(f"  σ_ε: {sig_eps.mean():.4f}")
-    print(f"  Final LL: {ll_hist[ll_hist != 0][-1]:.4e}")
 
 
 if __name__ == '__main__':

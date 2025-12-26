@@ -2,6 +2,8 @@
 """
 CLI wrapper for src/run_joint_inference_single_trial.py
 
+UPDATED: Now saves Z (latent spectral state) for dynamics comparison.
+
 Usage:
     python run_joint_inference_single.py --input ./data/sim.pkl --output ./results/joint.pkl
     python run_joint_inference_single.py --input ./data/sim.pkl --output ./results/joint.pkl --n_refreshes 5 --inner_steps 200
@@ -21,13 +23,55 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 import mne
-# UPDATED: Import from run_joint_inference_single_trial
 from src.run_joint_inference_single_trial import (
     run_joint_inference_single_trial, 
     SingleTrialInferenceConfig
 )
 from src.simulate_single_trial import build_history_design_single
 from src.utils_multitaper import derotate_tfr_align_start
+
+
+def extract_Z_from_trace(trace, J, M, window_sec, delta_spk):
+    """
+    Extract complex Z estimates from the trace.
+    
+    Returns
+    -------
+    Z_smooth : (J, K) complex array
+        Smoothed latent spectral states at block centers
+    Z_fine : (J, T_fine) complex array
+        Fine-scale latent states
+    """
+    if not hasattr(trace, 'fine_latent') or not trace.fine_latent:
+        return None, None
+    
+    try:
+        # fine_latent is (T, 2*J*M) with layout:
+        # [Re_j0m0, Im_j0m0, Re_j0m1, Im_j0m1, ..., Re_j{J-1}m{M-1}, Im_j{J-1}m{M-1}]
+        fine = np.asarray(trace.fine_latent[-1])  # Take last refresh
+        T_fine = fine.shape[0]
+        
+        # Reshape to (T, J, M, 2)
+        fine_4d = fine.reshape(T_fine, J, M, 2)
+        
+        # Extract Re and Im, average over tapers
+        Z_re = fine_4d[:, :, :, 0].mean(axis=2)  # (T, J)
+        Z_im = fine_4d[:, :, :, 1].mean(axis=2)  # (T, J)
+        
+        # Transpose to (J, T) and combine to complex
+        Z_fine = Z_re.T + 1j * Z_im.T  # (J, T_fine)
+        
+        # Downsample to block centers
+        fs = 1.0 / delta_spk
+        block_size = int(window_sec * fs)
+        K = T_fine // block_size
+        Z_smooth = Z_fine[:, ::block_size][:, :K]
+        
+        return Z_smooth, Z_fine
+    
+    except Exception as e:
+        print(f"  Warning: Could not extract Z: {e}")
+        return None, None
 
 
 def main():
@@ -45,7 +89,7 @@ def main():
     parser.add_argument('--freq_step', type=float, default=2.0)
     parser.add_argument('--window_sec', type=float, default=0.4)
     
-    # MCMC parameters - USE CORRECT NAMES from SingleTrialInferenceConfig
+    # MCMC parameters
     parser.add_argument('--fixed_iter', type=int, default=500,
                         help='Warmup iterations')
     parser.add_argument('--n_refreshes', type=int, default=5,
@@ -86,7 +130,9 @@ def main():
     
     # Frequency grid
     freqs = np.arange(args.freq_min, args.freq_max, args.freq_step)
-    print(f"  Frequency grid: {len(freqs)} bands ({freqs[0]:.0f}-{freqs[-1]:.0f} Hz)")
+    J = len(freqs)
+    M = 1  # Single taper for single-trial
+    print(f"  Frequency grid: {J} bands ({freqs[0]:.0f}-{freqs[-1]:.0f} Hz)")
     
     # Compute spectrogram
     print("Computing multitaper spectrogram...")
@@ -100,10 +146,10 @@ def main():
         zero_mean=False
     ).squeeze()[:, None, :]  # (J, 1, T)
     
-    M = int(args.window_sec * fs)
-    tfr = derotate_tfr_align_start(tfr, freqs, fs, 1, M)
-    tapers, _ = mne.time_frequency.multitaper.dpss_windows(M, 1, Kmax=1)
-    Y_cube = (tfr * (2.0 / tapers.sum(axis=1)))[:, :, ::M]
+    block_size = int(args.window_sec * fs)
+    tfr = derotate_tfr_align_start(tfr, freqs, fs, 1, block_size)
+    tapers, _ = mne.time_frequency.multitaper.dpss_windows(block_size, 1, Kmax=1)
+    Y_cube = (tfr * (2.0 / tapers.sum(axis=1)))[:, :, ::block_size]
     print(f"  Y_cube shape: {Y_cube.shape}")
     
     # History design matrix
@@ -111,28 +157,25 @@ def main():
     H_hist = build_history_design_single(spikes, n_lags=20)
     print(f"  H_hist shape: {H_hist.shape}")
     
-    # Configure inference - USE CORRECT PARAMETER NAMES
+    # Configure inference
     config = SingleTrialInferenceConfig(
         fixed_iter=args.fixed_iter,
         n_refreshes=args.n_refreshes,
         inner_steps_per_refresh=args.inner_steps,
         trace_thin=args.trace_thin,
-        # Wald test band selection
         use_wald_band_selection=not args.no_wald_selection,
         wald_alpha=args.wald_alpha,
-        # Beta shrinkage
         use_beta_shrinkage=not args.no_shrinkage,
-        # EM kwargs
         em_kwargs=dict(max_iter=args.em_max_iter),
     )
     
-    # Run inference - USE CORRECT FUNCTION NAME AND ARGUMENT NAMES
+    # Run inference
     print("Running joint inference...")
     beta, gamma, theta, trace = run_joint_inference_single_trial(
         Y_cube=Y_cube,
-        spikes_ST=spikes,         # RENAMED from 'spikes'
-        H_STL=H_hist,             # RENAMED from 'H_hist'
-        all_freqs=freqs,          # RENAMED from 'freqs_hz'
+        spikes_ST=spikes,
+        H_STL=H_hist,
+        all_freqs=freqs,
         delta_spk=delta_spk,
         window_sec=args.window_sec,
         config=config,
@@ -140,6 +183,15 @@ def main():
     
     print(f"  beta shape: {beta.shape}")
     print(f"  gamma shape: {gamma.shape}")
+    
+    # Extract Z estimates from trace
+    print("Extracting Z estimates...")
+    Z_smooth, Z_fine = extract_Z_from_trace(trace, J, M, args.window_sec, delta_spk)
+    if Z_smooth is not None:
+        print(f"  Z_smooth shape: {Z_smooth.shape}")
+        print(f"  Z_fine shape: {Z_fine.shape}")
+    else:
+        print("  Warning: Could not extract Z estimates from trace")
     
     # Build output dict
     output = {
@@ -155,6 +207,7 @@ def main():
             'gamma': np.stack(trace.gamma) if trace.gamma else None,
         },
         'freqs': freqs,
+        'window_sec': args.window_sec,
         'config': {
             'fixed_iter': args.fixed_iter,
             'n_refreshes': args.n_refreshes,
@@ -165,6 +218,12 @@ def main():
         },
     }
     
+    # Add Z estimates (for dynamics comparison)
+    if Z_smooth is not None:
+        output['Z_smooth'] = Z_smooth  # (J, K) complex
+        output['Z_fine'] = Z_fine      # (J, T_fine) complex
+        output['trace']['Z_fine'] = Z_fine  # Also in trace for compatibility
+    
     # Add Wald test results if available
     if hasattr(trace, 'wald_significant_mask'):
         output['wald'] = {
@@ -173,15 +232,14 @@ def main():
             'pval': np.asarray(trace.wald_p_values),
         }
         n_sig = trace.wald_significant_mask.sum()
-        print(f"  Wald test: {n_sig}/{len(freqs)} bands significant")
+        print(f"  Wald test: {n_sig}/{J} bands significant")
     
     # Add shrinkage factors if available
     if hasattr(trace, 'shrinkage_factors') and trace.shrinkage_factors:
         output['shrinkage_factors'] = np.stack(trace.shrinkage_factors)
     
     # Add coupling summary
-    S, P = beta.shape
-    J = (P - 1) // 2
+    S = beta.shape[0]
     beta_R = beta[:, 1:1+J]
     beta_I = beta[:, 1+J:1+2*J]
     beta_mag = np.sqrt(beta_R**2 + beta_I**2)
@@ -203,6 +261,7 @@ def main():
         pickle.dump(output, f)
     
     print(f"Saved to {args.output}")
+    print(f"  Output keys: {list(output.keys())}")
 
 
 if __name__ == '__main__':

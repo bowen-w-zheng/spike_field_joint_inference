@@ -29,7 +29,7 @@ def main():
         freqs_hz_extra=np.array([]),
         S=4,
         k_active=2,
-        duration_sec=60.0,
+        duration_sec=120.0,
         fs=1000.0,
         delta_spk=0.001,
         half_bw_hz=np.array([0.05, 0.05, 0.05]),
@@ -74,9 +74,10 @@ def main():
     lfp = data['LFP']
     fs = 1000.0
     window_sec = 0.4
-    NW_product = 1
+    NW_product = 2  # M = 2*NW - 1 = 3 tapers
     
-    tfr_raw = mne.time_frequency.tfr_array_multitaper(
+    # Compute TFR
+    tfr_out = mne.time_frequency.tfr_array_multitaper(
         lfp[None, None, :],
         sfreq=fs,
         freqs=freqs_inf,
@@ -84,23 +85,42 @@ def main():
         time_bandwidth=2 * NW_product,
         output='complex',
         zero_mean=False,
-    ).squeeze()
+    )
     
-    tfr_raw = tfr_raw[:, None, :]
-    M = int(round(window_sec * fs))
-    tfr = derotate_tfr_align_start(tfr_raw, freqs_inf, fs, 1, M)
+    # Handle MNE output shape: (epochs, channels, tapers, freqs, times)
+    tfr_out = np.asarray(tfr_out)
+    print(f"   Raw TFR from MNE: {tfr_out.shape}")
     
-    tapers, _ = mne.time_frequency.multitaper.dpss_windows(M, NW_product, Kmax=1)
-    scaling_factor = 2.0 / tapers.sum(axis=1)
-    tfr = tfr * scaling_factor
+    if tfr_out.ndim == 5:
+        # (epochs=1, channels=1, tapers, freqs, times) -> (J, M, T)
+        tfr_raw = tfr_out[0, 0]  # (tapers, freqs, times)
+        tfr_raw = tfr_raw.transpose(1, 0, 2)  # -> (freqs, tapers, times) = (J, M, T)
+    elif tfr_out.ndim == 4:
+        # (epochs=1, channels=1, freqs, times) -> (J, 1, T)
+        tfr_raw = tfr_out[0, 0, :, None, :]
+    else:
+        raise ValueError(f"Unexpected TFR shape: {tfr_out.shape}")
     
-    Y_cube = tfr[:, :, ::M]
+    J, M_tapers, T = tfr_raw.shape
+    print(f"   tfr_raw: {tfr_raw.shape} (J={J}, M={M_tapers}, T={T})")
+    
+    # Derotate
+    block_size = int(round(window_sec * fs))
+    tfr = derotate_tfr_align_start(tfr_raw, freqs_inf, fs, 1, block_size)
+    
+    # Scale by taper normalization
+    tapers, _ = mne.time_frequency.multitaper.dpss_windows(block_size, NW_product, Kmax=1)
+    scaling_factor = 2.0 / tapers.sum(axis=1)  # (M_tapers,)
+    tfr = tfr * scaling_factor[None, :, None]  # Broadcast: (J, M, T)
+    
+    # Downsample to blocks: (J, M, K)
+    Y_cube = tfr[:, :, ::block_size]
     print(f"   Y_cube shape: {Y_cube.shape}")
     
     print("\n3. Building history design matrix...")
     H = build_history_design_single(data['spikes'], n_lags=20)
     print(f"   H shape: {H.shape}")
-    
+    print(f"Y_cube: max={np.abs(Y_cube).max():.6e}, mean={np.abs(Y_cube).mean():.6e}")
     print("\n4. Running joint inference...")
     inf_config = SingleTrialInferenceConfig(
         fixed_iter=200,
