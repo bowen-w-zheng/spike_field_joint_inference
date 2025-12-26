@@ -17,10 +17,12 @@ import numpy as np
 import argparse
 from dataclasses import dataclass, asdict
 from simulate_trial_data import TrialSimConfig
-# Add path to joint inference source code
-WORKSPACE_PATH = "/orcd/data/ekmiller/001/bowen/spike-field-joint-inference"
-if WORKSPACE_PATH not in sys.path:
-    sys.path.append(WORKSPACE_PATH)
+# Add the project root to the working directory and python path
+import pathlib
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 
 @dataclass
