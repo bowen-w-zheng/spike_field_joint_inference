@@ -1,27 +1,36 @@
-"""
-JAX-native joint inference with latent standardization and beta shrinkage.
-"""
+# run_joint_inference_single_trial.py
+# DIRECT COPY of run_joint_inference_trials_hier_shrinkage.py
+# ONLY CHANGES: R=1 hardcoded, removed trial loops, shape adjustments
+#
+# All functions copied VERBATIM from document 7 (trial-structured version)
 
-from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, Sequence, Tuple, Dict, Any
 import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax import vmap, lax
-from functools import partial
+import sys
+import os
 import gc
 
-from src.joint_inference_core import JointMoments
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from src.params import OUParams
-from src.priors import gamma_prior_simple
-from src.polyagamma_jax import sample_pg_saddle_single
 from src.utils_joint import Trace
+from src.state_index import StateIndex
+from tqdm.auto import tqdm
+
+from src.joint_inference_core import joint_kf_rts_moments
+from src.beta_sampler_trials_jax_test import TrialBetaConfig, gibbs_update_beta_trials_shared_Xrtp_vectorized
+from src.polyagamma_jax import sample_pg_saddle_single
+
+jax.config.update("jax_enable_x64", True)
 
 
-# ============================================================================
-# Pure JAX utility functions
-# ============================================================================
+# ========================= JAX helpers =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py
 
 @jax.jit
 def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.ndarray:
@@ -34,442 +43,964 @@ def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.nda
 @jax.jit
 def _build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
     T = latent_reim.shape[0]
-    return jnp.concatenate([jnp.ones((T, 1)), latent_reim], axis=1)
+    return jnp.concatenate([jnp.ones((T, 1), dtype=latent_reim.dtype), latent_reim], axis=1)
 
 
 @jax.jit
-def _gibbs_update_beta_gamma_jax(
-    key, beta, gamma, tau2_lat, X, H, spikes, V,
-    Prec_gamma, mu_gamma, omega, tau2_intercept, a0_ard, b0_ard,
-):
-    key1, key2 = jr.split(key)
-    T, P = X.shape
-    R = H.shape[1]
-    twoB = P - 1
-
-    kappa = spikes - 0.5
-    Prec_beta_diag = jnp.zeros(P)
-    Prec_beta_diag = Prec_beta_diag.at[0].set(1.0 / tau2_intercept)
-    Prec_beta_diag = Prec_beta_diag.at[1:].set(1.0 / jnp.maximum(tau2_lat, 1e-12))
-
-    sqrt_omega = jnp.sqrt(omega)[:, None]
-    Xw = sqrt_omega * X
-    Hw = sqrt_omega * H
-
-    Prec_beta_block = Xw.T @ Xw + jnp.diag(Prec_beta_diag)
-    diag_add = V.T @ omega
-    Prec_beta_block = Prec_beta_block.at[1:, 1:].add(jnp.diag(diag_add))
-
-    Prec_gamma_block = Hw.T @ Hw + Prec_gamma
-    Prec_cross = Xw.T @ Hw
-
-    Prec = jnp.zeros((P + R, P + R))
-    Prec = Prec.at[:P, :P].set(Prec_beta_block)
-    Prec = Prec.at[:P, P:].set(Prec_cross)
-    Prec = Prec.at[P:, :P].set(Prec_cross.T)
-    Prec = Prec.at[P:, P:].set(Prec_gamma_block)
-
-    h_beta = X.T @ kappa
-    h_gamma = H.T @ kappa + Prec_gamma @ mu_gamma
-    h = jnp.concatenate([h_beta, h_gamma])
-
-    Prec = 0.5 * (Prec + Prec.T) + 1e-8 * jnp.eye(P + R)
-    L = jnp.linalg.cholesky(Prec)
-    v = jax.scipy.linalg.solve_triangular(L, h, lower=True)
-    mean = jax.scipy.linalg.solve_triangular(L.T, v, lower=False)
-
-    eps = jr.normal(key1, shape=(P + R,))
-    theta = mean + jax.scipy.linalg.solve_triangular(L.T, eps, lower=False)
-
-    beta_new = theta[:P]
-    gamma_new = theta[P:]
-
-    beta_lat = beta_new[1:]
-    alpha_post = a0_ard + 0.5
-    beta_post = b0_ard + 0.5 * (beta_lat ** 2)
-    tau2_lat_new = 1.0 / jr.gamma(key2, alpha_post, shape=(twoB,)) * beta_post
-
-    return beta_new, gamma_new, tau2_lat_new
+def _compute_psi_all(
+    X_RTP: jnp.ndarray,
+    beta_S: jnp.ndarray,
+    gamma_SRL: jnp.ndarray,
+    H_SRTL: jnp.ndarray
+) -> jnp.ndarray:
+    base_SRT = jnp.einsum('rtp,sp->srt', X_RTP, beta_S)
+    hist_SRT = jnp.einsum('srtk,srk->srt', H_SRTL, gamma_SRL)
+    return base_SRT + hist_SRT
 
 
-_gibbs_update_vectorized = vmap(
-    _gibbs_update_beta_gamma_jax,
-    in_axes=(0, 0, 0, 0, None, 0, 0, None, 0, 0, 0, None, None, None)
-)
+@jax.jit
+def _sample_omega_pg_matrix(
+    key: "jr.KeyArray",
+    psi_SRT: jnp.ndarray,
+    omega_floor: float,
+) -> jnp.ndarray:
+    S, R, T = psi_SRT.shape
+    keys = jr.split(key, S * R)
+    omega_flat = jax.vmap(
+        lambda k, psi: _sample_omega_pg_batch(k, psi, omega_floor)
+    )(keys, psi_SRT.reshape(-1, T))
+    return omega_flat.reshape(S, R, T)
 
+def _reim_from_fine_single(mu_fine_RTP, var_fine_RTP, J, M):
+    """Convert fine state to [Re | Im] format averaged over tapers."""
+    R, T, _ = mu_fine_RTP.shape
+    tmp = mu_fine_RTP.reshape(R, T, J, M, 2)
+    vtmp = var_fine_RTP.reshape(R, T, J, M, 2)
+    mu_re = tmp[..., 0].mean(axis=3)
+    mu_im = tmp[..., 1].mean(axis=3)
+    vr_re = vtmp[..., 0].mean(axis=3) / M
+    vr_im = vtmp[..., 1].mean(axis=3) / M
+    return np.concatenate([mu_re, mu_im], axis=2), np.concatenate([vr_re, vr_im], axis=2)
 
-@partial(jax.jit, static_argnames=['n_iter'])
-def _warmup_loop_scan(
-    key, beta_init, gamma_init, tau2_init, X, H_all, spikes_all, V,
-    Prec_gamma_all, mu_gamma_all, omega_floor, tau2_intercept, a0_ard, b0_ard, n_iter,
-):
-    S = beta_init.shape[0]
+# ========================= Standardization =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py
 
-    def scan_fn(carry, key_iter):
-        beta, gamma, tau2 = carry
-        psi_all = vmap(lambda b, g, h: X @ b + h @ g)(beta, gamma, H_all)
-        keys_omega = jr.split(key_iter, S)
-        omega_all = vmap(lambda k, psi: _sample_omega_pg_batch(k, psi, omega_floor))(keys_omega, psi_all)
-        keys_gibbs = jr.split(jr.fold_in(key_iter, 1), S)
-        beta_new, gamma_new, tau2_new = _gibbs_update_vectorized(
-            keys_gibbs, beta, gamma, tau2, X, H_all, spikes_all, V,
-            Prec_gamma_all, mu_gamma_all, omega_all, tau2_intercept, a0_ard, b0_ard
-        )
-        return (beta_new, gamma_new, tau2_new), (beta_new, gamma_new)
-
-    keys = jr.split(key, n_iter)
-    init_carry = (beta_init, gamma_init, tau2_init)
-    final_carry, history = lax.scan(scan_fn, init_carry, keys)
-    return final_carry, history
-
-
-@partial(jax.jit, static_argnames=['n_iter'])
-def _inner_loop_scan(
-    key, beta_init, gamma_init, tau2_init, beta0_fixed, X, H_all, spikes_all, V,
-    Prec_gamma_lock, mu_gamma_post, Sigma_gamma_post, omega_floor, tau2_intercept,
-    a0_ard, b0_ard, n_iter,
-):
-    S = beta_init.shape[0]
-    R = gamma_init.shape[1]
-
-    def scan_fn(carry, key_iter):
-        beta, gamma, tau2 = carry
-        keys_gamma = jr.split(key_iter, S)
-
-        def sample_mvn(key, mu, Sigma):
-            L = jnp.linalg.cholesky(Sigma + 1e-6 * jnp.eye(R))
-            z = jr.normal(key, shape=(R,))
-            return mu + L @ z
-
-        gamma_samp = vmap(sample_mvn)(keys_gamma, mu_gamma_post, Sigma_gamma_post)
-        psi_all = vmap(lambda b, g, h: X @ b + h @ g)(beta, gamma_samp, H_all)
-        keys_omega = jr.split(jr.fold_in(key_iter, 1), S)
-        omega_all = vmap(lambda k, psi: _sample_omega_pg_batch(k, psi, omega_floor))(keys_omega, psi_all)
-        keys_gibbs = jr.split(jr.fold_in(key_iter, 2), S)
-        beta_new, _, tau2_new = _gibbs_update_vectorized(
-            keys_gibbs, beta, gamma_samp, tau2, X, H_all, spikes_all, V,
-            Prec_gamma_lock, gamma_samp, omega_all, tau2_intercept, a0_ard, b0_ard
-        )
-        beta_new = beta_new.at[:, 0].set(beta0_fixed)
-        return (beta_new, gamma_samp, tau2_new), (beta_new, gamma_samp)
-
-    keys = jr.split(key, n_iter)
-    init_carry = (beta_init, gamma_init, tau2_init)
-    final_carry, history = lax.scan(scan_fn, init_carry, keys)
-    return final_carry, history
-
-
-# ============================================================================
-# Standardization and Shrinkage
-# ============================================================================
-
-def _standardize_latents(lat_reim, var_reim, scale_factors=None):
-    """Standardize latents to unit variance."""
-    T, twoJ = lat_reim.shape
+def _standardize_latents(
+    lat_reim_RTP: np.ndarray,
+    var_reim_RTP: np.ndarray,
+    min_std: float = 0.01,
+    scale_factors: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Standardize each frequency band to have approximately unit std."""
+    R, T, twoJ = lat_reim_RTP.shape
+    
+    lat_std = np.zeros_like(lat_reim_RTP)
+    var_std = np.zeros_like(var_reim_RTP)
+    
     if scale_factors is None:
-        scale_factors = np.zeros(twoJ)
+        scale_factors = np.zeros(twoJ, dtype=float)
         for j in range(twoJ):
-            std_j = np.std(lat_reim[:, j])
-            scale_factors[j] = std_j if std_j > 1e-10 else 1.0
-    lat_scaled = lat_reim / scale_factors[None, :]
-    var_scaled = var_reim / (scale_factors[None, :] ** 2)
-    return lat_scaled, var_scaled, scale_factors
+            std_j = lat_reim_RTP[:, :, j].std()
+            scale_factors[j] = max(std_j, min_std)
+    
+    for j in range(twoJ):
+        lat_std[:, :, j] = lat_reim_RTP[:, :, j] / scale_factors[j]
+        var_std[:, :, j] = var_reim_RTP[:, :, j] / (scale_factors[j] ** 2)
+    
+    return lat_std, var_std, scale_factors
 
 
-def _unstandardize_beta(beta, scale_factors):
-    """Convert beta back to original units."""
-    if beta.ndim == 1:
-        beta_orig = beta.copy()
-        beta_orig[1:] = beta[1:] / scale_factors
+def _rescale_beta(
+    beta: np.ndarray,
+    scale_factors: np.ndarray,
+) -> np.ndarray:
+    """Rescale β from standardized to original units."""
+    beta_rescaled = beta.copy()
+    if beta.ndim == 2:
+        beta_rescaled[:, 1:] = beta_rescaled[:, 1:] / scale_factors[None, :]
+    elif beta.ndim == 3:
+        beta_rescaled[:, :, 1:] = beta_rescaled[:, :, 1:] / scale_factors[None, None, :]
     else:
-        beta_orig = beta.copy()
-        beta_orig[:, 1:] = beta[:, 1:] / scale_factors[None, :]
-    return beta_orig
+        raise ValueError(f"Unexpected beta shape: {beta.shape}")
+    return beta_rescaled
 
 
-def _apply_beta_shrinkage(beta_samples, burn_in_frac=0.5):
-    """Apply empirical Bayes shrinkage. INTERLEAVED format."""
-    n_samples, S, P = beta_samples.shape
+# ========================= Beta Shrinkage =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py
+
+def _apply_beta_shrinkage(
+    beta_samples: np.ndarray,
+    burn_in_frac: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply empirical Bayes shrinkage to β estimates.
+    
+    shrink[j] = |E[β_j]|² / (|E[β_j]|² + Var(β_j))
+    
+    This attenuates uncertain frequency components (high variance relative to mean).
+    Frequencies with strong signal have shrink ≈ 1, noise frequencies have shrink ≈ 0.
+    """
+    n_samples = beta_samples.shape[0]
+    burn_in = int(burn_in_frac * n_samples)
+    samples = beta_samples[burn_in:]
+    
+    beta_mean = samples.mean(axis=0)
+    beta_var = samples.var(axis=0)
+    
+    S, P = beta_mean.shape
     J = (P - 1) // 2
-    burn = int(burn_in_frac * n_samples)
-    post = beta_samples[burn:]
+    
+    beta_shrunk = beta_mean.copy()
+    shrink_factors = np.ones((S, J), dtype=float)
+    
+    for j in range(J):
+        idx_re = 1 + j
+        idx_im = 1 + J + j
+        
+        mag_sq = beta_mean[:, idx_re]**2 + beta_mean[:, idx_im]**2
+        var_sum = beta_var[:, idx_re] + beta_var[:, idx_im]
+        
+        shrink = mag_sq / (mag_sq + var_sum + 1e-12)
+        shrink_factors[:, j] = shrink
+        
+        beta_shrunk[:, idx_re] *= shrink
+        beta_shrunk[:, idx_im] *= shrink
+    
+    return beta_shrunk, shrink_factors
 
-    shrinkage = np.zeros((S, J))
-    beta_shrunk = np.median(post, axis=0)
+
+def _print_shrinkage_diagnostics(
+    shrink_factors: np.ndarray,
+    freqs_hz: Sequence[float],
+    max_neurons: int = 2,
+) -> None:
+    """Print shrinkage diagnostics for each frequency."""
+    pass  # Silenced for cleaner output
+
+
+# ========================= Wald Test Band Selection =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py
+
+def _wald_test_band_selection(
+    beta_samples: np.ndarray,
+    J: int,
+    alpha: float = 0.05,
+    burn_in_frac: float = 0.5,
+    verbose: bool = True,
+    freqs_hz: Optional[Sequence[float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Perform Wald test to select (neuron, band) pairs with significant spike coupling.
+
+    Tests H0: β_j = 0 (no coupling) for each (neuron, band) pair.
+
+    Returns:
+        significant_mask: (J,) bool - True if ANY neuron is significantly coupled to band
+        W_stats: (S, J) Wald statistics per (neuron, band)
+        p_values: (S, J) p-values per (neuron, band)
+    """
+    from scipy import stats
+
+    n_samples, S, P = beta_samples.shape
+
+    burn_in = int(burn_in_frac * n_samples)
+    samples = beta_samples[burn_in:]
+    n_post = samples.shape[0]
+
+    # Layout: [β₀, βR_0, ..., βR_{J-1}, βI_0, ..., βI_{J-1}]
+    beta_R = samples[:, :, 1:1+J]        # (n_post, S, J)
+    beta_I = samples[:, :, 1+J:1+2*J]    # (n_post, S, J)
+
+    mean_R = beta_R.mean(axis=0)  # (S, J)
+    mean_I = beta_I.mean(axis=0)  # (S, J)
+    var_R = beta_R.var(axis=0)    # (S, J)
+    var_I = beta_I.var(axis=0)    # (S, J)
+
+    # Wald statistic: W = β̂_R²/Var(β_R) + β̂_I²/Var(β_I) ~ χ²(2)
+    W_stats = np.zeros((S, J))
+    p_values = np.zeros((S, J))
 
     for s in range(S):
         for j in range(J):
-            idx_re = 1 + 2*j
-            idx_im = 2 + 2*j
-            mean_re = post[:, s, idx_re].mean()
-            mean_im = post[:, s, idx_im].mean()
-            mean_mag_sq = mean_re**2 + mean_im**2
-            var_re = post[:, s, idx_re].var()
-            var_im = post[:, s, idx_im].var()
-            var_total = var_re + var_im
-            shrinkage[s, j] = mean_mag_sq / (mean_mag_sq + var_total + 1e-12)
-            beta_shrunk[s, idx_re] *= shrinkage[s, j]
-            beta_shrunk[s, idx_im] *= shrinkage[s, j]
+            if var_R[s, j] > 1e-10 and var_I[s, j] > 1e-10:
+                W_stats[s, j] = (mean_R[s, j]**2 / var_R[s, j] +
+                                mean_I[s, j]**2 / var_I[s, j])
+                p_values[s, j] = 1 - stats.chi2.cdf(W_stats[s, j], df=2)
+            else:
+                W_stats[s, j] = 0.0
+                p_values[s, j] = 1.0
 
-    return shrinkage, beta_shrunk
+    # Band is significant if ANY neuron shows significance
+    significant_mask = (p_values < alpha).any(axis=0)  # (J,)
+
+    if verbose:
+        n_sig_bands = significant_mask.sum()
+        n_sig_pairs = (p_values < alpha).sum()
+        total_pairs = S * J
+        print(f"[WALD] Band selection (α={alpha}, burn-in={burn_in_frac}):")
+        print(f"[WALD]   Using {n_post} post-burn-in samples")
+        print(f"[WALD]   Significant (neuron,band) pairs: {n_sig_pairs}/{total_pairs}")
+        print(f"[WALD]   Bands with ANY significant coupling: {n_sig_bands}/{J}")
+
+        if freqs_hz is not None:
+            sig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if significant_mask[j]]
+            nonsig_freqs = [f"{freqs_hz[j]:.1f}Hz" for j in range(J) if not significant_mask[j]]
+
+            if sig_freqs:
+                print(f"[WALD]   Coupled bands (joint KF): {', '.join(sig_freqs)}")
+            if nonsig_freqs and len(nonsig_freqs) <= 10:
+                print(f"[WALD]   Uncoupled bands (LFP-only): {', '.join(nonsig_freqs)}")
+            elif nonsig_freqs:
+                print(f"[WALD]   Uncoupled bands (LFP-only): {len(nonsig_freqs)} bands")
+
+    return significant_mask, W_stats, p_values
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
+def _zero_nonsignificant_beta_per_pair(
+    beta: np.ndarray,
+    p_values: np.ndarray,
+    J: int,
+    alpha: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Zero β coefficients for non-significant (neuron, band) pairs.
+    
+    This is PAIR-SPECIFIC: each (s, j) pair is gated independently.
+    """
+    S, P = beta.shape
+    beta_masked = beta.copy()
+    significant_pairs = p_values < alpha  # (S, J)
+    
+    n_zeroed = 0
+    for s in range(S):
+        for j in range(J):
+            if not significant_pairs[s, j]:
+                beta_masked[s, 1 + j] = 0.0        # β_R,j = 0
+                beta_masked[s, 1 + J + j] = 0.0    # β_I,j = 0
+                n_zeroed += 1
+    
+    n_sig = significant_pairs.sum()
+    print(f"[GATING] β masking: {n_sig}/{S*J} pairs significant, {n_zeroed} zeroed")
+    
+    return beta_masked, significant_pairs
+
+
+def _apply_true_band_gating(
+    Z_fine_kf: np.ndarray,       # (R, T, 2*J*M) from joint KF
+    Z_var_kf: np.ndarray,        # (R, T, 2*J*M) from joint KF
+    Z_fine_lfponly: np.ndarray,  # (R, T, 2*J*M) from LFP-only (EM)
+    Z_var_lfponly: np.ndarray,   # (R, T, 2*J*M) from LFP-only (EM)
+    significant_mask: np.ndarray, # (J,) boolean - True if ANY neuron coupled
+    J: int,
+    M: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    TRUE per-band gating: Use joint KF estimates ONLY for coupled bands.
+    For uncoupled bands (no significant neurons), keep the LFP-only estimates.
+    """
+    # Start with LFP-only estimates
+    Z_gated = Z_fine_lfponly.copy()
+    Z_var_gated = Z_var_lfponly.copy()
+    
+    n_coupled = 0
+    n_uncoupled = 0
+    
+    for j in range(J):
+        if significant_mask[j]:
+            # This band IS coupled - use joint KF estimates
+            n_coupled += 1
+            for m in range(M):
+                col_re = 2 * (j * M + m)
+                col_im = col_re + 1
+                Z_gated[:, :, col_re] = Z_fine_kf[:, :, col_re]
+                Z_gated[:, :, col_im] = Z_fine_kf[:, :, col_im]
+                Z_var_gated[:, :, col_re] = Z_var_kf[:, :, col_re]
+                Z_var_gated[:, :, col_im] = Z_var_kf[:, :, col_im]
+        else:
+            # This band is NOT coupled - keep LFP-only (already in Z_gated)
+            n_uncoupled += 1
+    
+    print(f"[GATING] State gating: {n_coupled} bands from joint KF, {n_uncoupled} bands from LFP-only")
+    
+    return Z_gated, Z_var_gated
+
+
+def _select_significant_neurons(
+    p_values: np.ndarray,
+    alpha: float = 0.05,
+    verbose: bool = True,
+) -> np.ndarray:
+    """
+    Select neurons that show significant coupling to at least one band.
+    """
+    S, J = p_values.shape
+
+    # Neuron is significant if coupled to ANY band
+    neuron_mask = (p_values < alpha).any(axis=1)  # (S,)
+
+    if verbose:
+        n_sig = neuron_mask.sum()
+        print(f"[WALD] Neuron selection: {n_sig}/{S} neurons have significant coupling")
+
+        if n_sig < S:
+            excluded = np.where(~neuron_mask)[0]
+            if len(excluded) <= 10:
+                print(f"[WALD]   Excluded neurons (no coupling): {excluded.tolist()}")
+            else:
+                print(f"[WALD]   Excluded neurons: {len(excluded)} total")
+
+    return neuron_mask
+
+
+def _zero_nonsignificant_beta_per_neuron(
+    beta: np.ndarray,
+    p_values: np.ndarray,
+    J: int,
+    alpha: float = 0.05,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Zero β[s,j] when neuron s is NOT significantly coupled to band j.
+    """
+    S, P = beta.shape
+    assert P == 1 + 2 * J, f"Expected P={1+2*J}, got {P}"
+    assert p_values.shape == (S, J), f"Expected p_values shape ({S},{J}), got {p_values.shape}"
+
+    beta_masked = beta.copy()
+    significant_pairs = p_values < alpha  # (S, J) boolean
+
+    for s in range(S):
+        for j in range(J):
+            if not significant_pairs[s, j]:
+                # SEPARATED layout: βR at 1+j, βI at 1+J+j
+                beta_masked[s, 1 + j] = 0.0          # β_R[s,j] = 0
+                beta_masked[s, 1 + J + j] = 0.0      # β_I[s,j] = 0
+
+    if verbose:
+        n_zeroed = (~significant_pairs).sum()
+        n_sig = significant_pairs.sum()
+        print(f"[GATING] {n_sig}/{S*J} (neuron,band) pairs significant, {n_zeroed} zeroed")
+
+    return beta_masked, significant_pairs
+
+
+# ========================= Prior helpers =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py
+
+def _reduce_mu(mu_raw: Optional[np.ndarray], L: int) -> np.ndarray:
+    if mu_raw is None:
+        return np.zeros(L, dtype=float)
+    mu_arr = np.asarray(mu_raw, float)
+    if mu_arr.ndim == 1:
+        assert mu_arr.shape[0] == L
+        return mu_arr
+    if mu_arr.ndim == 2:
+        assert mu_arr.shape[1] == L
+        return mu_arr.mean(axis=0)
+    raise ValueError(f"mu prior has unsupported shape: {mu_arr.shape}")
+
+
+def _prec_from_sigma(Sigma_raw: Optional[np.ndarray], L: int) -> np.ndarray:
+    if Sigma_raw is None:
+        return np.eye(L, dtype=float) * 1e-6
+    Sigma_arr = np.asarray(Sigma_raw, float)
+    if Sigma_arr.ndim == 2:
+        base = Sigma_arr
+    elif Sigma_arr.ndim == 3:
+        base = Sigma_arr.mean(axis=0)
+    else:
+        raise ValueError(f"Sigma prior has unsupported shape: {Sigma_arr.shape}")
+    base = base + 1e-8 * np.eye(L, dtype=float)
+    return np.linalg.inv(base)
+
+
+def _slice_mu(mu_prior, s, S, R):
+    if mu_prior is None:
+        return None
+    mu_arr = np.asarray(mu_prior, float)
+    if mu_arr.ndim == 1:
+        return mu_arr
+    if mu_arr.ndim == 2:
+        if mu_arr.shape[0] == S:
+            return mu_arr[s]
+        if mu_arr.shape[0] == R:
+            return mu_arr
+    if mu_arr.ndim == 3:
+        return mu_arr[s]
+    raise ValueError(f"mu prior has unsupported shape: {mu_arr.shape}")
+
+
+def _slice_sigma(Sigma_prior, s, S, R):
+    if Sigma_prior is None:
+        return None
+    Sigma_arr = np.asarray(Sigma_prior, float)
+    if Sigma_arr.ndim == 2:
+        return Sigma_arr
+    if Sigma_arr.ndim == 3:
+        if Sigma_arr.shape[0] == S:
+            return Sigma_arr[s]
+        if Sigma_arr.shape[0] == R:
+            return Sigma_arr
+    if Sigma_arr.ndim == 4:
+        return Sigma_arr[s]
+    raise ValueError(f"Sigma prior has unsupported shape: {Sigma_arr.shape}")
+
+
+def _prepare_gamma_priors(mu_prior, Sigma_prior, S, R, L, dtype):
+    mu_out = np.zeros((S, L), dtype=float)
+    prec_out = np.zeros((S, L, L), dtype=float)
+    for s in range(S):
+        mu_raw = _slice_mu(mu_prior, s, S, R)
+        Sig_raw = _slice_sigma(Sigma_prior, s, S, R)
+        mu_out[s] = _reduce_mu(mu_raw, L)
+        prec_out[s] = _prec_from_sigma(Sig_raw, L)
+    return jnp.asarray(prec_out, dtype=dtype), jnp.asarray(mu_out, dtype=dtype)
+
+
+def _rotate_reim_for_spikes(
+    lat_reim_RTP: np.ndarray,
+    var_reim_RTP: np.ndarray,
+    freqs_hz: Sequence[float],
+    delta_spk: float,
+    offset_sec: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Modulate complex latents by e^{+i 2π f t} for spike coupling."""
+    R, T, twoJ = lat_reim_RTP.shape
+    J = twoJ // 2
+
+    t = offset_sec + np.arange(T, dtype=float) * float(delta_spk)
+    freqs = np.asarray(freqs_hz, float).reshape(1, J)
+    phi = 2.0 * np.pi * t[:, None] * freqs
+
+    cos = np.cos(phi)[None, :, :]
+    sin = np.sin(phi)[None, :, :]
+
+    Re = lat_reim_RTP[:, :, :J]
+    Im = lat_reim_RTP[:, :, J:]
+    Vr = var_reim_RTP[:, :, :J]
+    Vi = var_reim_RTP[:, :, J:]
+
+    # e^{+iωt}(R + iI) = (R cos - I sin) + i(R sin + I cos)
+    Re_rot = Re * cos - Im * sin
+    Im_rot = Re * sin + Im * cos
+    Vr_rot = Vr * (cos ** 2) + Vi * (sin ** 2)
+    Vi_rot = Vr * (sin ** 2) + Vi * (cos ** 2)
+
+    return np.concatenate([Re_rot, Im_rot], axis=2), np.concatenate([Vr_rot, Vi_rot], axis=2)
+
+
+# ========================= Config =========================
+# VERBATIM from run_joint_inference_trials_hier_shrinkage.py (renamed class only)
 
 @dataclass
-class InferenceConfig:
-    fixed_iter: int = 100
+class SingleTrialInferenceConfig:
+    """Configuration for single-trial joint inference."""
+    fixed_iter: int = 500
     beta0_window: int = 100
     n_refreshes: int = 3
     inner_steps_per_refresh: int = 100
     omega_floor: float = 1e-3
     sigma_u: float = 0.05
-    pg_jax: bool = True
-    use_standardization: bool = True
-    use_shrinkage: bool = True
-    shrinkage_burn_in: float = 0.5
+    tau2_intercept: float = 100.0 ** 2
+    tau2_gamma: float = 25.0 ** 2
+    a0_ard: float = 1e-2
+    b0_ard: float = 1e-2
+    use_exact_cov: bool = False
+    em_kwargs: Dict[str, Any] = field(default_factory=dict)
+    key_jax: Optional["jr.KeyArray"] = None
+    freeze_beta0: bool = False
+    # Standardization
+    standardize_latents: bool = True
+    min_latent_std: float = 0.01
+    # Memory optimization
+    trace_thin: int = 2
+    # Beta shrinkage
+    use_beta_shrinkage: bool = True
+    beta_shrinkage_burn_in: float = 0.5
+    # Wald test band selection (TRUE GATING)
+    use_wald_band_selection: bool = True
+    wald_alpha: float = 0.05
+    wald_burn_in_frac: float = 0.5
+    verbose_wald: bool = True
 
 
-# ============================================================================
-# Main function
-# ============================================================================
+# ========================= EM adapters =========================
+# ADAPTED for single-trial (no X/D decomposition)
 
-def run_joint_inference_jax(
-    Y_cube_block: np.ndarray,
-    params0: OUParams,
-    spikes: np.ndarray,
-    H_hist: np.ndarray,
-    all_freqs: np.ndarray,
-    build_design: Callable,
-    extract_band_reim_with_var: Callable,
-    gibbs_update_beta_robust: Callable,
-    joint_kf_rts_moments: Callable,
-    em_theta_from_joint: Callable,
-    config: Optional[InferenceConfig] = None,
+def _theta_from_em_single(res, J, M):
+    """Extract θ from single-trial EM result."""
+    lam = np.asarray(getattr(res, "lam"), float).reshape(J, M)
+    sigv = np.asarray(getattr(res, "sigv"), float).reshape(J, M)
+    sig_eps = np.asarray(getattr(res, "sig_eps"), float).reshape(J, M)
+    
+    return OUParams(lam=lam, sig_v=sigv, sig_eps=sig_eps)
+
+
+def _extract_Z_from_upsampled_single(upsampled, J, M):
+    """Extract Z from single-trial EM upsampling."""
+    # For single-trial EM, Z_mean is (J, M, T) complex
+    Zm = np.asarray(upsampled.Z_mean)  # (J, M, Tf) complex
+    Zv = np.asarray(upsampled.Z_var)   # (J, M, Tf) real
+    
+    J_, M_, Tf = Zm.shape
+    assert (J_, M_) == (J, M)
+    
+    # Convert to fine state format (T, 2*J*M)
+    Z_fine = np.zeros((Tf, 2 * J * M), float)
+    Z_var_fine = np.zeros((Tf, 2 * J * M), float)
+    
+    for j in range(J):
+        for m in range(M):
+            col = 2 * (j * M + m)
+            Z_fine[:, col] = Zm[j, m, :].real
+            Z_fine[:, col + 1] = Zm[j, m, :].imag
+            Z_var_fine[:, col] = Zv[j, m, :]
+            Z_var_fine[:, col + 1] = Zv[j, m, :]
+    
+    # Add R=1 dimension for compatibility: (1, T, 2*J*M)
+    return Z_fine[None, :, :], Z_var_fine[None, :, :]
+
+
+
+
+# ========================= Main runner =========================
+# ADAPTED from run_joint_inference_trials_hier for R=1
+
+def run_joint_inference_single_trial(
+    Y_cube: np.ndarray,              # (J, M, K) - CHANGED from Y_trials (R, J, M, K)
+    spikes_ST: np.ndarray,           # (S, T) - CHANGED from spikes_SRT (S, R, T)
+    H_STL: np.ndarray,               # (S, T, L) - CHANGED from H_SRTL (S, R, T, L)
+    all_freqs: Sequence[float],
     *,
     delta_spk: float,
     window_sec: float,
-    rng_pg: np.random.Generator = np.random.default_rng(0),
-    key_jax=None,
     offset_sec: float = 0.0,
-):
-    if key_jax is None:
-        with jax.default_device(jax.devices("cpu")[0]):
-            key_jax = jr.PRNGKey(0)
-
+    beta_init: Optional[np.ndarray] = None,
+    gamma_prior_mu: Optional[np.ndarray] = None,
+    gamma_prior_Sigma: Optional[np.ndarray] = None,
+    config: Optional[SingleTrialInferenceConfig] = None,
+) -> Tuple[np.ndarray, np.ndarray, OUParams, Trace]:
+    """
+    Single-trial joint inference of spike-field coupling.
+    
+    DIRECT PORT of run_joint_inference_trials_hier with R=1.
+    
+    WITH TRUE BAND GATING:
+    - Wald test identifies significant (neuron, band) pairs
+    - Pair-specific β masking for spike observations
+    - TRUE band gating: uncoupled bands keep LFP-only (EM) estimates
+    
+    Returns β in ORIGINAL (non-standardized) units.
+    """
     if config is None:
-        config = InferenceConfig()
+        config = SingleTrialInferenceConfig()
+    key = config.key_jax or jr.PRNGKey(0)
 
-    sigma_u = config.sigma_u
-    use_standardization = config.use_standardization
-    use_shrinkage = config.use_shrinkage
-    shrinkage_burn_in = config.shrinkage_burn_in
+    print("[SINGLE-TRIAL] Starting joint inference...")
+    print(f"[SINGLE-TRIAL] freeze_beta0 = {config.freeze_beta0}")
+    print(f"[SINGLE-TRIAL] standardize_latents = {config.standardize_latents}")
+    print(f"[SINGLE-TRIAL] use_beta_shrinkage = {config.use_beta_shrinkage}")
+    print(f"[SINGLE-TRIAL] use_wald_band_selection = {config.use_wald_band_selection}")
+    print(f"[SINGLE-TRIAL] trace_thin = {config.trace_thin}")
+    if config.use_wald_band_selection:
+        print(f"[SINGLE-TRIAL] TRUE GATING ENABLED:")
+        print(f"[SINGLE-TRIAL]   - Pair-specific β masking")
+        print(f"[SINGLE-TRIAL]   - Uncoupled bands keep LFP-only estimates")
 
-    print("[JAX-V2] Starting inference...")
-    print(f"[JAX-V2] Standardization={use_standardization}, Shrinkage={use_shrinkage}")
+    # SINGLE TRIAL: R=1
+    R = 1
+    J, M, K = Y_cube.shape
+    S, T_f = spikes_ST.shape
+    Rlags = H_STL.shape[-1]
+    P = 1 + 2 * J
+    print(f"[SINGLE-TRIAL] Data dimensions: R={R}, S={S}, J={J}, M={M}, T={T_f}, Rlags={Rlags}")
 
-    J, M, K = Y_cube_block.shape
-    single_spike_mode = (spikes.ndim == 1)
+    # Reshape inputs to have R dimension for compatibility
+    Y_trials = Y_cube[None, :, :, :]  # (1, J, M, K)
+    spikes_SRT = spikes_ST[:, None, :]  # (S, 1, T)
+    H_SRTL = H_STL[:, None, :, :]  # (S, 1, T, L)
 
-    if single_spike_mode:
-        spikes_S = spikes[None, :]
-        H_hist_S = H_hist[None, :, :]
+    # 0) Single-trial EM warm start
+    from src.em_ct_single_jax import em_ct_single_jax
+    em_kwargs = dict(max_iter=1000, tol=1e-6, sig_eps_init=10.0, verbose=True, log_every=100)
+    if config.em_kwargs:
+        em_kwargs.update(config.em_kwargs)
+    print("[SINGLE-TRIAL] Running EM warm start...")
+    res = em_ct_single_jax(Y=jnp.asarray(Y_cube), db=window_sec, **em_kwargs)
+    theta = _theta_from_em_single(res, J=J, M=M)
+    print("[SINGLE-TRIAL] EM complete")
+    print(f"[SINGLE-TRIAL] θ: λ range [{theta.lam.min():.4f}, {theta.lam.max():.4f}]")
+
+    # 1) Upsample Z to fine grid
+    from src.upsample_ct_single_fine import upsample_ct_single_fine
+    print("[SINGLE-TRIAL] Upsampling EM latents to fine grid...")
+    ups = upsample_ct_single_fine(
+        Y=Y_cube, res=res, delta_spk=delta_spk,
+        win_sec=window_sec, offset_sec=offset_sec, T_f=None
+    )
+    print(f"DEBUG: ups.Z_mean shape={ups.Z_mean.shape}, max={np.abs(ups.Z_mean).max():.6e}, min={np.abs(ups.Z_mean).min():.6e}")
+
+    Z_fine, Z_var_fine = _extract_Z_from_upsampled_single(ups, J=J, M=M)
+    print(f"DEBUG: Z_fine shape={Z_fine.shape}, max={np.abs(Z_fine).max():.6e}")
+
+    # =====================================================================
+    # STORE EM ESTIMATES AS LFP-ONLY REFERENCE (NEVER MODIFY THESE)
+    # =====================================================================
+    Z_fine_em = Z_fine.copy()  # (1, T, 2*J*M)
+    Z_var_em = Z_var_fine.copy()
+    print(f"[SINGLE-TRIAL] Stored EM estimates as LFP-only reference (shape: {Z_fine_em.shape})")
+    # Store in trace for output
+    lat_reim_RTP, var_reim_RTP = _reim_from_fine_single(Z_fine, Z_var_fine, J=J, M=M)
+    T0 = min(T_f, lat_reim_RTP.shape[1])
+    lat_reim_RTP = lat_reim_RTP[:, :T0]
+    var_reim_RTP = var_reim_RTP[:, :T0]
+    print(f"DEBUG: lat_reim (before rotation) shape={lat_reim_RTP.shape}, max={np.abs(lat_reim_RTP).max():.6e}")
+
+    # Modulate for spike coupling (e^{+iωt} convention)
+    lat_reim_RTP, var_reim_RTP = _rotate_reim_for_spikes(
+        lat_reim_RTP, var_reim_RTP, all_freqs,
+        delta_spk=delta_spk, offset_sec=offset_sec
+    )
+    print(f"DEBUG: lat_reim (after rotation) shape={lat_reim_RTP.shape}, max={np.abs(lat_reim_RTP).max():.6e}")
+    # Standardize
+    if config.standardize_latents:
+        lat_reim_RTP, var_reim_RTP, latent_scale_factors = _standardize_latents(
+            lat_reim_RTP, var_reim_RTP, min_std=config.min_latent_std
+        )
+        print(f"[SINGLE-TRIAL] Latent scale factors (min={latent_scale_factors.min():.4f}, "
+              f"max={latent_scale_factors.max():.4f})")
     else:
-        spikes_S = spikes
-        H_hist_S = H_hist
+        latent_scale_factors = np.ones(2 * J, dtype=float)
+        print("[SINGLE-TRIAL] Latent standardization DISABLED")
+    
+    latent_scales_jax = jnp.asarray(latent_scale_factors)
 
-    S, T_total = spikes_S.shape
-    R = H_hist_S.shape[2]
+    spikes_SRT = spikes_SRT[:, :, :T0]
+    H_SRTL = H_SRTL[:, :, :T0, :]
+    spikes_SRT_jax = jnp.asarray(spikes_SRT)
+    H_SRTL_jax = jnp.asarray(H_SRTL)
 
-    theta = OUParams(
-        lam=params0.lam,
-        sig_v=params0.sig_v,
-        sig_eps=np.broadcast_to(params0.sig_eps, (J, M))
+    X_RTP = np.concatenate([np.ones((R, T0, 1)), lat_reim_RTP], axis=2)
+    X_jax = jnp.asarray(X_RTP)
+    V_SRTB = jnp.broadcast_to(jnp.asarray(var_reim_RTP)[None, ...], (S, R, T0, 2 * J))
+
+    # 2) Init β, γ
+    beta = np.zeros((S, P), float) if beta_init is None else np.asarray(beta_init, float)
+    assert beta.shape == (S, P)
+    beta = jnp.asarray(beta)
+
+    if gamma_prior_mu is None:
+        gamma = np.zeros((S, R, Rlags), float)
+    else:
+        gamma = np.asarray(gamma_prior_mu, float)
+        gamma = gamma[None, None, :] if gamma.ndim == 1 else (gamma[:, None, :] if gamma.ndim == 2 else gamma)
+        gamma = np.broadcast_to(gamma, (S, R, Rlags))
+    gamma = jnp.asarray(gamma)
+
+    tau2_lat = jnp.ones((S, 2 * J), dtype=X_jax.dtype)
+    Prec_gamma_init, mu_gamma_init = _prepare_gamma_priors(
+        gamma_prior_mu, gamma_prior_Sigma, S, R, Rlags, X_jax.dtype
     )
 
-    from src.ou_fine import kalman_filter_rts_ffbs_fine
-    fine0 = kalman_filter_rts_ffbs_fine(
-        Y_cube_block, theta, delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec
-    )
-
-    lat_reim_np, var_reim_np = extract_band_reim_with_var(
-        mu_fine=np.asarray(fine0.mu)[:-1],
-        var_fine=np.asarray(fine0.var)[:-1],
-        coupled_bands=all_freqs, freqs_hz=all_freqs, delta_spk=delta_spk, J=J, M=M
-    )
-
-    scale_factors = None
-    if use_standardization:
-        lat_reim_np, var_reim_np, scale_factors = _standardize_latents(lat_reim_np, var_reim_np)
-        print(f"[JAX-V2] Scale factors: [{scale_factors.min():.4f}, {scale_factors.max():.4f}]")
-
-    lat_reim_jax = jnp.asarray(lat_reim_np)
-    design_np = np.asarray(build_design(lat_reim_jax))
-    T_design = min(int(design_np.shape[0]), H_hist_S.shape[1], spikes_S.shape[1])
-
-    X_jax = jnp.array(design_np[:T_design], dtype=jnp.float64)
-    V_jax = jnp.array(var_reim_np[:T_design], dtype=jnp.float64)
-    spikes_jax = jnp.array(spikes_S[:, :T_design], dtype=jnp.float64)
-    H_jax = jnp.array(H_hist_S[:, :T_design, :], dtype=jnp.float64)
-
-    B = len(all_freqs)
-    P = 1 + 2*B
-
-    beta_jax = jnp.zeros((S, P), dtype=jnp.float64)
-    gamma_jax = jnp.zeros((S, R), dtype=jnp.float64)
-    tau2_lat_jax = jnp.ones((S, 2*B), dtype=jnp.float64)
-    a0_ard, b0_ard = 1e-2, 1e-2
-
-    mu_g, Sig_g = gamma_prior_simple(n_lags=R, strong_neg=-2.5, mild_neg=-0.5, k_mild=4, tau_gamma=1.5)
-    Prec_gamma_all = jnp.array([np.linalg.pinv(Sig_g) for _ in range(S)])
-    mu_gamma_all = jnp.array([mu_g for _ in range(S)])
-
-    print(f"[JAX-V2] S={S}, T={T_design}, B={B}, R={R}, P={P}")
-
+    # 3) Trace
     trace = Trace()
-    trace.theta.append(theta)
-    trace.latent.append(lat_reim_jax)
-    trace.fine_latent.append(np.asarray(fine0.mu))
+    trace.theta = [theta]
+    trace.shrinkage_factors = []
+    trace.Z_fine_em = Z_fine_em
+    trace.Z_var_em = Z_var_em
 
-    # Warmup
-    import time
-    t0 = time.time()
-    key_warmup, key_jax = jr.split(key_jax)
-    (beta_jax, gamma_jax, tau2_lat_jax), (beta_history, gamma_history) = _warmup_loop_scan(
-        key_warmup, beta_jax, gamma_jax, tau2_lat_jax, X_jax, H_jax, spikes_jax, V_jax,
-        Prec_gamma_all, mu_gamma_all, config.omega_floor, 100.0**2, a0_ard, b0_ard, config.fixed_iter
+    # 4) Warmup loop
+    tb_cfg = TrialBetaConfig(
+        omega_floor=config.omega_floor,
+        tau2_intercept=config.tau2_intercept,
+        tau2_gamma=config.tau2_gamma,
+        a0_ard=config.a0_ard,
+        b0_ard=config.b0_ard,
     )
-    beta_jax.block_until_ready()
-    print(f"[JAX-V2] Warmup: {time.time()-t0:.2f}s")
+    beta_hist, gamma_hist = [], []
+    print("[SINGLE-TRIAL] Starting warmup loop...")
+    warmup_iter = tqdm(range(config.fixed_iter), desc="Warmup (PG-Gibbs)")
+    for it in warmup_iter:
+        psi_SRT = _compute_psi_all(X_jax, beta, gamma, H_SRTL_jax)
+        key_pg, key = jr.split(key)
+        omega_SRT = _sample_omega_pg_matrix(key_pg, psi_SRT, config.omega_floor)
 
-    beta_np = np.array(beta_jax)
-    beta_hist_np = np.array(beta_history)
-    gamma_hist_np = np.array(gamma_history)
-
-    beta0_window = min(config.beta0_window, config.fixed_iter)
-    beta0_fixed = np.median(beta_hist_np[-beta0_window:, :, 0], axis=0)
-    beta_np[:, 0] = beta0_fixed
-    beta_jax = jnp.array(beta_np)
-
-    mu_g_post = np.zeros((S, R), dtype=np.float64)
-    Sig_g_post = np.zeros((S, R, R), dtype=np.float64)
-    Sig_g_lock = np.zeros((S, R, R), dtype=np.float64)
-
-    for s in range(S):
-        gh = gamma_hist_np[:, s, :]
-        mu_s = gh.mean(axis=0)
-        ctr = gh - mu_s[None, :]
-        Sg = (ctr.T @ ctr) / max(gh.shape[0] - 1, 1) + 1e-6 * np.eye(R)
-        mu_g_post[s] = mu_s
-        Sig_g_post[s] = Sg
-        Sig_g_lock[s] = np.diag(1e-6 * np.clip(np.diag(Sg), 1e-10, None))
-
-    for i in range(config.fixed_iter):
-        trace.beta.append(beta_hist_np[i])
-        trace.gamma.append(gamma_hist_np[i])
-
-    beta0_fixed_jax = jnp.array(beta0_fixed)
-    mu_gamma_post_jax = jnp.array(mu_g_post)
-    Sigma_gamma_post_jax = jnp.array(Sig_g_post)
-    Prec_gamma_lock_jax = jnp.array([np.linalg.pinv(Sig_g_lock[s]) for s in range(S)])
-
-    from src.state_index import StateIndex
-    sidx = StateIndex(J, M)
-
-    # Refresh passes
-    for r in range(config.n_refreshes):
-        print(f"[JAX-V2] Refresh {r+1}/{config.n_refreshes}")
-
-        key_inner, key_jax = jr.split(key_jax)
-        (beta_jax, gamma_jax, tau2_lat_jax), (beta_history, gamma_history) = _inner_loop_scan(
-            key_inner, beta_jax, gamma_jax, tau2_lat_jax, beta0_fixed_jax, X_jax, H_jax,
-            spikes_jax, V_jax, Prec_gamma_lock_jax, mu_gamma_post_jax, Sigma_gamma_post_jax,
-            config.omega_floor, 100.0**2, a0_ard, b0_ard, config.inner_steps_per_refresh
+        key, beta, gamma_shared, tau2_lat = gibbs_update_beta_trials_shared_Xrtp_vectorized(
+            key, X_jax, H_SRTL_jax, spikes_SRT_jax, omega_SRT, V_SRTB,
+            Prec_gamma_init, mu_gamma_init, tau2_lat, latent_scales_jax, tb_cfg
         )
-        beta_jax.block_until_ready()
+        gamma = jnp.broadcast_to(gamma_shared[:, None, :], (S, R, gamma_shared.shape[1]))
+        
+        if it % config.trace_thin == 0:
+            beta_hist.append(np.asarray(beta))
+            gamma_hist.append(np.asarray(gamma))
 
-        beta_np = np.array(beta_jax)
-        gamma_np = np.array(gamma_jax)
-        beta_hist_inner = np.array(beta_history)
+    beta_hist = np.stack(beta_hist, axis=0)
+    gamma_hist = np.stack(gamma_hist, axis=0)
+    print(f"[SINGLE-TRIAL] Warmup complete ({len(beta_hist)} samples stored)")
 
-        # Shrinkage
-        if use_shrinkage:
-            shrinkage_factors, beta_median = _apply_beta_shrinkage(beta_hist_inner, shrinkage_burn_in)
-            if r == 0:
-                print(f"[JAX-V2] Shrinkage: [{shrinkage_factors.min():.3f}, {shrinkage_factors.max():.3f}]")
-        else:
-            beta_median = np.median(beta_hist_inner, axis=0)
-
-        # Rescale for KF
-        if use_standardization:
-            beta_median_orig = _unstandardize_beta(beta_median, scale_factors)
-        else:
-            beta_median_orig = beta_median
-
-        for i in range(config.inner_steps_per_refresh):
-            trace.beta.append(np.array(beta_history[i]))
-            trace.gamma.append(np.array(gamma_history[i]))
-
-        # Omega for refresh
-        key_omega_refresh, key_jax = jr.split(key_jax)
-        keys_gamma_refresh = jr.split(key_omega_refresh, S)
-
-        def sample_mvn(key, mu, Sigma):
-            L = jnp.linalg.cholesky(Sigma + 1e-6 * jnp.eye(R))
-            return mu + L @ jr.normal(key, shape=(R,))
-
-        gamma_refresh_jax = vmap(sample_mvn)(keys_gamma_refresh, mu_gamma_post_jax, Sigma_gamma_post_jax)
-        psi_refresh_all = vmap(lambda b, g, h: X_jax @ b + h @ g)(jnp.array(beta_median), gamma_refresh_jax, H_jax)
-        keys_omega_all = jr.split(jr.fold_in(key_omega_refresh, 1), S)
-        omega_refresh_jax = vmap(lambda k, psi: _sample_omega_pg_batch(k, psi, config.omega_floor))(keys_omega_all, psi_refresh_all)
-
-        omega_refresh = np.array(omega_refresh_jax)
-        gamma_np = np.array(gamma_refresh_jax)
-
-        # KF refresh
-        mom = joint_kf_rts_moments(
-            Y_cube=Y_cube_block, theta=theta,
-            delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
-            beta=beta_median_orig, gamma=gamma_np, spikes=spikes_S, omega=omega_refresh,
-            coupled_bands_idx=np.arange(J, dtype=np.int64),
-            freqs_for_phase=np.asarray(all_freqs, np.float64),
-            sidx=sidx, H_hist=H_hist_S, sigma_u=sigma_u
-        )
-
-        lat_reim_np, var_reim_np = extract_band_reim_with_var(
-            mu_fine=mom.m_s, var_fine=mom.P_s,
-            coupled_bands=all_freqs, freqs_hz=all_freqs, delta_spk=delta_spk, J=J, M=M
-        )
-
-        if use_standardization:
-            lat_reim_np, var_reim_np, _ = _standardize_latents(lat_reim_np, var_reim_np, scale_factors)
-
-        lat_reim_jax = jnp.asarray(lat_reim_np)
-        design_np = np.asarray(build_design(lat_reim_jax))
-        X_jax = jnp.array(np.ascontiguousarray(design_np[:T_design], dtype=np.float64))
-        V_jax = jnp.array(np.ascontiguousarray(var_reim_np[:T_design], dtype=np.float64))
-        beta_jax = jnp.array(beta_np)
-        gamma_jax = jnp.array(gamma_np)
-
-        trace.theta.append(theta)
-        gc.collect()
-
-    trace.latent.append(lat_reim_jax)
-    trace.fine_latent.append(mom.m_s)
-
-    beta_final = np.array(beta_jax)
-    gamma_final = np.array(gamma_jax)
-
-    if use_standardization:
-        beta_final = _unstandardize_beta(beta_final, scale_factors)
-
-    print("[JAX-V2] Done!")
-
-    if single_spike_mode:
-        return beta_final[0], gamma_final[0], theta, trace
+    # Freeze β₀ if requested
+    if config.freeze_beta0:
+        w = min(config.beta0_window // config.trace_thin, len(beta_hist))
+        w = max(w, 1)
+        beta0_fixed = np.mean(beta_hist[-w:, :, 0], axis=0)
+        beta0_fixed_jax = jnp.asarray(beta0_fixed, dtype=beta.dtype)
+        beta = beta.at[:, 0].set(beta0_fixed_jax)
+        print(f"[SINGLE-TRIAL] Froze β₀ to median of last {w} warmup samples")
     else:
-        return beta_final, gamma_final, theta, trace
+        beta0_fixed_jax = None
 
+    # Bootstrap γ posterior
+    mu_g_post = gamma_hist.mean(axis=0)
+    Sig_g_post = np.zeros((S, R, Rlags, Rlags), float)
+    for s in range(S):
+        for r in range(R):
+            gh = gamma_hist[:, s, r, :]
+            ctr = gh - gh.mean(axis=0, keepdims=True)
+            Sg = (ctr.T @ ctr) / max(gh.shape[0] - 1, 1)
+            Sig_g_post[s, r] = Sg + 1e-6 * np.eye(Rlags)
 
+    Prec_g_lock = np.zeros_like(Sig_g_post)
+    for s in range(S):
+        for r in range(R):
+            d = np.clip(np.diag(Sig_g_post[s, r]), 1e-10, None)
+            Prec_g_lock[s, r] = np.diag(1e6 / d)
+
+    # Store warmup samples to trace
+    for i in range(len(beta_hist)):
+        trace.beta.append(beta_hist[i])
+        trace.gamma.append(gamma_hist[i])
+    
+    del beta_hist, gamma_hist
+    gc.collect()
+    print(f"[SINGLE-TRIAL] Warmup trace stored, memory freed")
+
+    # =================================================================
+    # WALD TEST FOR BAND SELECTION (after warmup)
+    # =================================================================
+    if config.use_wald_band_selection:
+        print("[SINGLE-TRIAL] Performing Wald test for band selection...")
+
+        # Stack all warmup samples
+        beta_samples_warmup = np.stack(trace.beta, axis=0)
+
+        # Perform Wald test
+        significant_mask, W_stats, p_values = _wald_test_band_selection(
+            beta_samples=beta_samples_warmup,
+            J=J,
+            alpha=config.wald_alpha,
+            burn_in_frac=config.wald_burn_in_frac,
+            verbose=config.verbose_wald,
+            freqs_hz=all_freqs,
+        )
+
+        # Store in trace
+        trace.wald_significant_mask = significant_mask
+        trace.wald_W_stats = W_stats
+        trace.wald_p_values = p_values
+
+        n_significant = significant_mask.sum()
+        print(f"[SINGLE-TRIAL] {n_significant}/{J} bands will use joint KF")
+        print(f"[SINGLE-TRIAL] {J - n_significant}/{J} bands will keep LFP-only (EM) estimates")
+    else:
+        # All bands are "significant" -> all go through joint KF
+        significant_mask = np.ones(J, dtype=bool)
+        p_values = np.zeros((S, J))  # All significant
+        print("[SINGLE-TRIAL] Wald test disabled - all bands use joint KF")
+
+    # 5) Refresh passes
+    sidx = StateIndex(J, M)
+    print(f"[SINGLE-TRIAL] Starting {config.n_refreshes} refresh passes...")
+    
+    for rr in range(config.n_refreshes):
+        print(f"[SINGLE-TRIAL] Refresh {rr + 1}/{config.n_refreshes}")
+        inner_beta_hist, inner_gamma_hist = [], []
+
+        inner_iter = tqdm(
+            range(config.inner_steps_per_refresh),
+            desc=f"Refresh {rr + 1} inner PG steps", leave=False
+        )
+        for it in inner_iter:
+            gamma_samp = np.zeros((S, R, Rlags), float)
+            for s in range(S):
+                for r in range(R):
+                    chol = np.linalg.cholesky(Sig_g_post[s, r])
+                    gamma_samp[s, r] = mu_g_post[s, r] + chol @ np.random.randn(Rlags)
+
+            gamma_samp_jax = jnp.asarray(gamma_samp)
+            key_pg, key = jr.split(key)
+            omega_SRT = _sample_omega_pg_matrix(
+                key_pg, _compute_psi_all(X_jax, beta, gamma_samp_jax, H_SRTL_jax),
+                config.omega_floor
+            )
+
+            key, beta, gamma_shared, tau2_lat = gibbs_update_beta_trials_shared_Xrtp_vectorized(
+                key, X_jax, H_SRTL_jax, spikes_SRT_jax, omega_SRT, V_SRTB,
+                jnp.asarray(Prec_g_lock), jnp.asarray(gamma_samp), tau2_lat, latent_scales_jax, tb_cfg
+            )
+            gamma = jnp.broadcast_to(gamma_shared[:, None, :], (S, R, gamma_shared.shape[1]))
+
+            if config.freeze_beta0:
+                beta = beta.at[:, 0].set(beta0_fixed_jax)
+
+            if it % config.trace_thin == 0:
+                inner_beta_hist.append(np.asarray(beta))
+                inner_gamma_hist.append(np.asarray(gamma))
+
+        inner_beta_hist = np.stack(inner_beta_hist, axis=0)
+        inner_gamma_hist = np.stack(inner_gamma_hist, axis=0)
+
+        # =================================================================
+        # BETA SHRINKAGE
+        # =================================================================
+        if config.use_beta_shrinkage:
+            beta_mean, shrink_factors = _apply_beta_shrinkage(
+                inner_beta_hist, burn_in_frac=config.beta_shrinkage_burn_in
+            )
+            _print_shrinkage_diagnostics(shrink_factors, all_freqs, max_neurons=2)
+            trace.shrinkage_factors.append(shrink_factors)
+        else:
+            beta_mean = np.mean(inner_beta_hist, axis=0)
+        
+        gamma_shared_for_refresh = np.median(inner_gamma_hist, axis=0).mean(axis=1)
+        beta = jnp.asarray(beta_mean)
+
+        # Rescale β to original units for KF refresh
+        beta_mean_original = _rescale_beta(beta_mean, latent_scale_factors) if config.standardize_latents else beta_mean
+
+        # =================================================================
+        # PAIR-SPECIFIC β MASKING: Zero non-significant (neuron, band) pairs
+        # =================================================================
+        if config.use_wald_band_selection:
+            beta_for_kf, significant_pairs = _zero_nonsignificant_beta_per_pair(
+                beta_mean_original, p_values, J, alpha=config.wald_alpha
+            )
+        else:
+            beta_for_kf = beta_mean_original
+
+        # Convert to INTERLEAVED for joint_kf_rts_moments
+        from src.utils_common import separated_to_interleaved
+        beta_interleaved = separated_to_interleaved(beta_for_kf)
+
+        # =================================================================
+        # KF REFRESH (single-trial: no pooling)
+        # =================================================================
+        print(f"[SINGLE-TRIAL] Refresh {rr + 1}: Running KF smoother...")
+
+        mom = joint_kf_rts_moments(
+            Y_cube=Y_cube,
+            theta=theta,
+            delta_spk=delta_spk,
+            win_sec=window_sec,
+            offset_sec=offset_sec,
+            beta=beta_interleaved,
+            gamma=np.asarray(gamma_shared_for_refresh),
+            spikes=np.asarray(spikes_SRT_jax[:, 0, :]),  # (S, T)
+            omega=np.asarray(omega_SRT[:, 0, :]),  # (S, T)
+            coupled_bands_idx=np.arange(J, dtype=np.int64),
+            freqs_for_phase=np.asarray(all_freqs, float),
+            sidx=sidx,
+            H_hist=np.asarray(H_SRTL_jax[:, 0, :, :]),  # (S, T, L)
+            sigma_u=config.sigma_u,
+            omega_floor=config.omega_floor,
+        )
+
+        Z_fine_kf = mom.m_s[None, :, :]   # (1, T, 2*J*M)
+        Z_var_kf = mom.P_s[None, :, :]    # (1, T, 2*J*M)
+
+        # =================================================================
+        # TRUE BAND GATING: Keep LFP-only (EM) estimates for uncoupled bands
+        # =================================================================
+        T_kf = Z_fine_kf.shape[1]
+        T0_new = min(T0, T_kf)
+        
+        if config.use_wald_band_selection:
+            Z_fine_gated, Z_var_gated = _apply_true_band_gating(
+                Z_fine_kf=Z_fine_kf[:, :T0_new, :],
+                Z_var_kf=Z_var_kf[:, :T0_new, :],
+                Z_fine_lfponly=Z_fine_em[:, :T0_new, :],
+                Z_var_lfponly=Z_var_em[:, :T0_new, :],
+                significant_mask=significant_mask,
+                J=J, M=M
+            )
+        else:
+            Z_fine_gated = Z_fine_kf[:, :T0_new, :]
+            Z_var_gated = Z_var_kf[:, :T0_new, :]
+
+        # Rebuild regressors from GATED smoothed Z
+        lat_reim_RTP, var_reim_RTP = _reim_from_fine_single(Z_fine_gated, Z_var_gated, J=J, M=M)
+        T0 = T0_new
+        lat_reim_RTP = lat_reim_RTP[:, :T0]
+        var_reim_RTP = var_reim_RTP[:, :T0]
+        
+        lat_reim_RTP, var_reim_RTP = _rotate_reim_for_spikes(
+            lat_reim_RTP, var_reim_RTP, all_freqs,
+            delta_spk=delta_spk, offset_sec=offset_sec
+        )
+
+        # Re-standardize using SAME scale factors
+        if config.standardize_latents:
+            lat_reim_RTP, var_reim_RTP, _ = _standardize_latents(
+                lat_reim_RTP, var_reim_RTP,
+                min_std=config.min_latent_std,
+                scale_factors=latent_scale_factors
+            )
+
+        X_RTP = np.concatenate([np.ones((R, T0, 1)), lat_reim_RTP], axis=2)
+        X_jax = jnp.asarray(X_RTP)
+        V_SRTB = jnp.broadcast_to(jnp.asarray(var_reim_RTP)[None, ...], (S, R, T0, 2 * J))
+        spikes_SRT_jax = jnp.asarray(spikes_SRT[:, :, :T0])
+        H_SRTL_jax = jnp.asarray(H_SRTL[:, :, :T0, :])
+
+        # Store to trace
+        trace.theta.append(theta)
+        
+        for i in range(len(inner_beta_hist)):
+            trace.beta.append(inner_beta_hist[i])
+            trace.gamma.append(inner_gamma_hist[i])
+
+        # Update γ posterior
+        mu_g_post = inner_gamma_hist.mean(axis=0)
+        Sig_g_post = np.zeros((S, R, Rlags, Rlags), float)
+        for s in range(S):
+            for r in range(R):
+                gh = inner_gamma_hist[:, s, r, :]
+                ctr = gh - gh.mean(axis=0, keepdims=True)
+                Sg = (ctr.T @ ctr) / max(gh.shape[0] - 1, 1)
+                Sig_g_post[s, r] = Sg + 1e-6 * np.eye(Rlags)
+        Prec_g_lock = np.zeros_like(Sig_g_post)
+        for s in range(S):
+            for r in range(R):
+                d = np.clip(np.diag(Sig_g_post[s, r]), 1e-10, None)
+                Prec_g_lock[s, r] = np.diag(1e6 / d)
+
+        del inner_beta_hist, inner_gamma_hist
+        gc.collect()
+        # Store final joint KF estimates (will be overwritten each refresh, final one kept)
+        trace.Z_fine_joint = Z_fine_gated
+        trace.Z_var_joint = Z_var_gated
+        print(f"[SINGLE-TRIAL] Refresh {rr + 1} complete (trace has {len(trace.beta)} samples)")
+
+    # =================================================================
+    # RESCALE β to original units
+    # =================================================================
+# =================================================================
+    # RESCALE β to original units
+    # =================================================================
+    beta_final = np.asarray(beta)
+    trace.beta_standardized = beta_final.copy()  # Store standardized version
+    if config.standardize_latents:
+        beta_final = _rescale_beta(beta_final, latent_scale_factors)
+    trace.latent_scale_factors = latent_scale_factors
+    trace.latent.append(lat_reim_RTP)
+    
+    print("[SINGLE-TRIAL] Inference complete")
+    print(f"[SINGLE-TRIAL] Total trace samples: {len(trace.beta)}")
+    if config.use_wald_band_selection:
+        print(f"[SINGLE-TRIAL]   - {significant_mask.sum()}/{J} bands used joint KF")
+        print(f"[SINGLE-TRIAL]   - {J - significant_mask.sum()}/{J} bands kept LFP-only")
+
+    # Return gamma squeezed to (S, L) for single trial
+    gamma_final = np.asarray(gamma)[:, 0, :]  # (S, R, L) -> (S, L)
+    
+    return beta_final, gamma_final, theta, trace
