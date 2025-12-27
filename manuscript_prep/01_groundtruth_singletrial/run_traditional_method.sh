@@ -4,14 +4,14 @@
 #SBATCH --error=slurm/traditional_methods_single_%A_%a.err
 #SBATCH --time=02:00:00
 #SBATCH --mem=16G
-#SBATCH --partition=ou_bcs_normal
+#SBATCH --partition=ou_bcs_low
 #SBATCH --array=0
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate jax312
 
 python compute_traditional_methods_single.py \
-    --data ./data/sim.pkl \
+    --data ./data/sim_single_trial.pkl \
     --output ./results/traditional_methods_single.pkl \
     --method both \
     --n_permutations 500 \

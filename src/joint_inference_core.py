@@ -401,5 +401,3 @@ def _rts_smoother_numpy(F_jm, m_p, P_p, m_f, P_f):
         m_s[t] = m_f[t] + C * (m_s[t+1] - m_p[t+1])
         P_s[t] = np.maximum(P_f[t] + C*C * (P_s[t+1] - P_p[t+1]), 1e-16)
     return m_s, P_s
-
-
